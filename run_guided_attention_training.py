@@ -223,6 +223,9 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         if enable_asa is None:
             enable_asa = self.apply_asa
 
+        # 只有当 apply_asa=True 时才真正启用 ASA
+        enable_asa = enable_asa and self.apply_asa
+
         feat2 = None
         attn2 = None
 
@@ -362,6 +365,77 @@ def evaluate(model, loader, criterion_cls):
     }
 
 
+def training_step(model, inputs, labels, optimizer, criterion_cls, criterion_guide, lambda_guidance):
+    """
+    统一的训练步骤：student forward + 可选的 reference/teacher forward for GGAS
+
+    返回: (total_loss, l_cls, l_guide)
+    """
+    inputs = inputs.to(device)
+    labels = labels.to(device)
+
+    # === student 分支：根据 USE_ASA 决定是否开启 ASA ===
+    outputs, feat2_s, attn2_s = model(
+        inputs,
+        enable_asa=USE_ASA,
+        return_guidance=True
+    )
+    l_cls = criterion_cls(outputs, labels)
+
+    # === teacher/reference 分支：关闭 ASA，生成 Grad-CAM 指导图 G ===
+    # 只有当 LAMBDA_GUIDANCE > 0 且 USE_ASA=True 时才计算 guidance
+    l_guide = torch.tensor(0.0, device=device)
+
+    if lambda_guidance > 0 and USE_ASA:
+        if attn2_s is None:
+            raise RuntimeError("attn2_s is None. USE_ASA=True 时应当产生 ASA2 注意力。")
+
+        # 保存当前训练状态，防止 BN 被 reference path 污染
+        was_training = model.training
+        model.eval()
+
+        # 关闭 ASA 生成 teacher logits (Grad-CAM 目标)
+        logits_t, feat2_t, _ = model(inputs, enable_asa=False, return_guidance=True)
+
+        model.train(was_training)
+
+        # 用真实标签算 teacher logits 的目标分数
+        target_scores_t = logits_t.gather(1, labels.unsqueeze(1)).squeeze(1)
+
+        gradients = torch.autograd.grad(
+            outputs=target_scores_t.sum(),
+            inputs=feat2_t,
+            retain_graph=False,
+            create_graph=False,
+        )[0]
+
+        weights = gradients.mean(dim=(2, 3), keepdim=True)
+        guidance_map_G = torch.sum(weights * feat2_t, dim=1, keepdim=True)
+        guidance_map_G = F.relu(guidance_map_G)
+
+        # normalize 到 [0,1]
+        b = guidance_map_G.shape[0]
+        g_flat = guidance_map_G.view(b, -1)
+        g_min = g_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
+        g_max = g_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
+        guidance_map_G = (guidance_map_G - g_min) / (g_max - g_min + 1e-8)
+
+        # 尺寸安全检查
+        assert guidance_map_G.shape == attn2_s.shape, \
+            f"Shape mismatch: guidance_map_G {guidance_map_G.shape} vs attn2_s {attn2_s.shape}"
+
+        # 用 MSE 监督 ASA 生成的注意力 attn2_s 去匹配 guidance_map_G
+        l_guide = criterion_guide(attn2_s, guidance_map_G.detach())
+
+    total_loss = l_cls + lambda_guidance * l_guide
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    return total_loss, l_cls, l_guide
+
+
 def train_with_guidance(train_loader, val_loader, fixed_epochs):
     model = LightweightVDLNet_PlacementAblation(
         num_classes=NUM_CLASSES,
@@ -390,58 +464,10 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
 
         loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{fixed_epochs}", leave=False)
         for inputs, labels in loop:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-
-            # === student 分支：开启 ASA，用于分类 + 产生 attn2(S) ===
-            outputs, feat2_s, attn2_s = model(inputs, enable_asa=True, return_guidance=True)
-            l_cls = criterion_cls(outputs, labels)
-
-            # === teacher 分支：关闭 ASA，生成 Grad-CAM 指导图 G ===
-            if LAMBDA_GUIDANCE > 0:
-                if attn2_s is None:
-                    raise RuntimeError("attn2_s is None. enable_asa=True 时应当产生 ASA2 注意力。")
-
-                # 保存当前训练状态
-                was_training = model.training
-                model.eval()  # 让 dropout/bn 稳定一些（可选但推荐）
-
-                # 关闭 ASA 生成 teacher logits
-                logits_t, feat2_t, _ = model(inputs, enable_asa=False, return_guidance=True)
-
-                model.train(was_training)
-
-                # 用真实标签算 teacher logits 的目标分数
-                target_scores_t = logits_t.gather(1, labels.unsqueeze(1)).squeeze(1)
-
-                gradients = torch.autograd.grad(
-                    outputs=target_scores_t.sum(),
-                    inputs=feat2_t,
-                    retain_graph=False,
-                    create_graph=False,
-                )[0]
-
-                weights = gradients.mean(dim=(2, 3), keepdim=True)
-                guidance_map_G = torch.sum(weights * feat2_t, dim=1, keepdim=True)
-                guidance_map_G = F.relu(guidance_map_G)
-
-                # normalize 到 [0,1]
-                b = guidance_map_G.shape[0]
-                g_flat = guidance_map_G.view(b, -1)
-                g_min = g_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-                g_max = g_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-                guidance_map_G = (guidance_map_G - g_min) / (g_max - g_min + 1e-8)
-
-                # 用 MSE 监督 ASA 生成的注意力 attn2_s 去匹配 guidance_map_G
-                l_guide = criterion_guide(attn2_s, guidance_map_G.detach())
-            else:
-                l_guide = torch.tensor(0.0, device=device)
-
-            total_loss = l_cls + LAMBDA_GUIDANCE * l_guide
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            total_loss, _, _ = training_step(
+                model, inputs, labels,
+                optimizer, criterion_cls, criterion_guide, LAMBDA_GUIDANCE
+            )
 
             running_loss += total_loss.item()
             loop.set_postfix(train_loss=f"{running_loss / max(1, len(train_loader)):.4f}")
@@ -538,58 +564,10 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
         loop = tqdm(train_loader, desc=f"Final train epoch {epoch + 1}/{best_epoch}", leave=False)
 
         for inputs, labels in loop:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-
-            # === student 分支：开启 ASA，用于分类 + 产生 attn2(S) ===
-            outputs, feat2_s, attn2_s = model(inputs, enable_asa=True, return_guidance=True)
-            l_cls = criterion_cls(outputs, labels)
-
-            # === teacher 分支：关闭 ASA，生成 Grad-CAM 指导图 G ===
-            if LAMBDA_GUIDANCE > 0:
-                if attn2_s is None:
-                    raise RuntimeError("attn2_s is None. enable_asa=True 时应当产生 ASA2 注意力。")
-
-                # 保存当前训练状态
-                was_training = model.training
-                model.eval()  # 让 dropout/bn 稳定一些（可选但推荐）
-
-                # 关闭 ASA 生成 teacher logits
-                logits_t, feat2_t, _ = model(inputs, enable_asa=False, return_guidance=True)
-
-                model.train(was_training)
-
-                # 用真实标签算 teacher logits 的目标分数
-                target_scores_t = logits_t.gather(1, labels.unsqueeze(1)).squeeze(1)
-
-                gradients = torch.autograd.grad(
-                    outputs=target_scores_t.sum(),
-                    inputs=feat2_t,
-                    retain_graph=False,
-                    create_graph=False,
-                )[0]
-
-                weights = gradients.mean(dim=(2, 3), keepdim=True)
-                guidance_map_G = torch.sum(weights * feat2_t, dim=1, keepdim=True)
-                guidance_map_G = F.relu(guidance_map_G)
-
-                # normalize 到 [0,1]
-                b = guidance_map_G.shape[0]
-                g_flat = guidance_map_G.view(b, -1)
-                g_min = g_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-                g_max = g_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-                guidance_map_G = (guidance_map_G - g_min) / (g_max - g_min + 1e-8)
-
-                # 用 MSE 监督 ASA 生成的注意力 attn2_s 去匹配 guidance_map_G
-                l_guide = criterion_guide(attn2_s, guidance_map_G.detach())
-            else:
-                l_guide = torch.tensor(0.0, device=device)
-
-            total_loss = l_cls + LAMBDA_GUIDANCE * l_guide
-
-            optimizer.zero_grad()
-            total_loss.backward()
-            optimizer.step()
+            training_step(
+                model, inputs, labels,
+                optimizer, criterion_cls, criterion_guide, LAMBDA_GUIDANCE
+            )
 
     # 保存模型
     model_path = f"guided_model_outer_{outer_test_well}_ASA{USE_ASA}_lambda{LAMBDA_GUIDANCE}.pt"
