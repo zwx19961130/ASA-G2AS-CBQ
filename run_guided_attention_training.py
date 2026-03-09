@@ -391,8 +391,9 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
                         "Guidance tensors are missing. Ensure apply_asa=True and forward pass sets guidance states."
                     )
 
-                pred_classes = outputs.argmax(dim=1)
-                target_scores = outputs.gather(1, pred_classes.unsqueeze(1)).squeeze()
+                # 修复：使用真实标签labels而不是预测标签来计算Grad-CAM引导图
+                # 这样引导模型关注"能让它预测出正确答案"的区域，而不是"它目前瞎猜"的区域
+                target_scores = outputs.gather(1, labels.unsqueeze(1)).squeeze()
 
                 gradients = torch.autograd.grad(
                     outputs=target_scores.sum(),
@@ -530,8 +531,9 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
                         "Guidance tensors are missing. Ensure apply_asa=True and forward pass sets guidance states."
                     )
 
-                pred_classes = outputs.argmax(dim=1)
-                target_scores = outputs.gather(1, pred_classes.unsqueeze(1)).squeeze()
+                # 修复：使用真实标签labels而不是预测标签来计算Grad-CAM引导图
+                # 这样引导模型关注"能让它预测出正确答案"的区域，而不是"它目前瞎猜"的区域
+                target_scores = outputs.gather(1, labels.unsqueeze(1)).squeeze()
 
                 gradients = torch.autograd.grad(
                     outputs=target_scores.sum(),

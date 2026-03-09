@@ -1,118 +1,125 @@
+# -*- coding: utf-8 -*-
+# evaluate_attention_modules.py
+# Attention Ablation Study with Two-Level Leave-One-Well-Out
+
 import os
+import random
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+from tqdm import tqdm
+
 import torch
 import torch.nn as nn
-import torchvision.models as models
 import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader, random_split
-from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, auc, classification_report
 from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
-import numpy as np
-from tqdm import tqdm
-import copy  # 导入copy模块用于保存最佳模型
-import pandas as pd  # To save classification reports to CSV
-import random # 导入random模块
 
 # ==============================================================================
-# 设置随机种子 (Set Random Seeds) - 添加到这里！
+# Configuration
 # ==============================================================================
-def set_seed(seed):
-    torch.manual_seed(seed) # PyTorch CPU
-    torch.cuda.manual_seed(seed) # PyTorch GPU
-    torch.cuda.manual_seed_all(seed) # PyTorch Multi-GPU
-    np.random.seed(seed) # NumPy
-    random.seed(seed) # Python built-in random module
-    torch.backends.cudnn.deterministic = True # 确保使用确定性算法
-    torch.backends.cudnn.benchmark = False # 关闭CUDNN benchmark，它可能引入不确定性
-    os.environ['PYTHONHASHSEED'] = str(seed) # 设置Python哈希种子
 
-SEED = 42 # 定义你的固定种子
-set_seed(SEED)
-
-# ==============================================================================
-# 配置参数 (Configurations)
-# ==============================================================================
+SEED = 42
 DATA_DIR = "vdl_slices_20px"
 BATCH_SIZE = 32
 NUM_CLASSES = 3
-EPOCHS = 100  # 增加epoch数量，因为有早停机制，不必担心过拟合
-LEARNING_RATE = 2e-5  # 降低初始学习率
+LEARNING_RATE = 2e-5
 IMAGE_SIZE = (500, 40)
-VAL_SPLIT = 0.16
-TEST_SPLIT = 0.20
+INNER_EPOCHS = 50
+USE_WEIGHTED_SAMPLER = True
+USE_CLASS_WEIGHT_IN_LOSS = False
+NUM_WORKERS = 4
 
-# 更新了模型和结果的保存路径，以反映新的ResNet18架构
-MODEL_SAVE_PATH = "resnet18_asa_model_final.pt"
-BEST_MODEL_SAVE_PATH = "resnet18_asa_model_best.pt"  # 新增：最佳模型保存路径
-CONFUSION_PATH = "confusion_matrix_val_resnet18_asa.png"
-CONFUSION_TEST_PATH = "confusion_matrix_test_resnet18_asa.png"
-ACC_PLOT_PATH = "accuracy_curve_resnet18_asa.png"
-
-# ==============================================================================
 # Attention Configuration - Change this to run ablation experiments
-# ==============================================================================
 ATTENTION = "ASA"  # Options: "ASA", "SE", "ECA", "CBAM", None
 
-# 早停机制参数
-PATIENCE = 30  # 早停的耐心值，连续10个epoch验证损失不下降则停止
-MIN_DELTA = 1e-6  # 最小改进，小于此值不认为有提升
-
-# 标签映射
 label_map = {"Good": 0, "Midrate": 1, "Poor": 2}
 label_names = ["Good", "Midrate", "Poor"]
 
 # ==============================================================================
-# 数据集定义 (Dataset Definition)
+# Helper Functions
+# ==============================================================================
+
+
+def is_valid_well_dir(root_dir, well_name):
+    """Filter non-well folders such as hidden dirs and notebook checkpoints."""
+    well_path = os.path.join(root_dir, well_name)
+    if not os.path.isdir(well_path):
+        return False
+    if well_name.startswith("."):
+        return False
+    if "checkpoint" in well_name.lower():
+        return False
+    if well_name == "__pycache__":
+        return False
+    return True
+
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+
+set_seed(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==============================================================================
+# Dataset (supports filtering by well)
 # ==============================================================================
 
 
 class CementVDLDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
+    def __init__(self, root_dir, transform=None, selected_wells=None):
         self.samples = []
         self.transform = transform
-        for label_name, label_idx in label_map.items():
-            class_dir = os.path.join(root_dir, label_name)
-            for fname in os.listdir(class_dir):
-                if fname.endswith(".png"):
-                    self.samples.append(
-                        (os.path.join(class_dir, fname), label_idx))
+
+        all_wells = sorted(
+            [w for w in os.listdir(root_dir) if is_valid_well_dir(root_dir, w)]
+        )
+
+        if selected_wells is None:
+            wells = all_wells
+        else:
+            selected_set = set(selected_wells)
+            wells = [w for w in all_wells if w in selected_set]
+
+        for well in wells:
+            well_dir = os.path.join(root_dir, well)
+            for label_name, label_idx in label_map.items():
+                class_dir = os.path.join(well_dir, label_name)
+                if not os.path.isdir(class_dir):
+                    continue
+
+                for fname in os.listdir(class_dir):
+                    if fname.endswith(".png"):
+                        self.samples.append((os.path.join(class_dir, fname), label_idx))
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         image_path, label = self.samples[idx]
-        image = Image.open(image_path).convert("L")  # 转换为灰度图
+        image = Image.open(image_path).convert("L")
         if self.transform:
             image = self.transform(image)
         return image, label
 
 
 # ==============================================================================
-# 数据加载 (Data Loading)
+# Attention Modules
 # ==============================================================================
-transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
-    transforms.ToTensor()
-])
-
-full_dataset = CementVDLDataset(DATA_DIR, transform=transform)
-total_size = len(full_dataset)
-test_size = int(total_size * TEST_SPLIT)
-val_size = int(total_size * VAL_SPLIT)
-train_size = total_size - val_size - test_size
-
-train_dataset, val_dataset, test_dataset = random_split(
-    full_dataset, [train_size, val_size, test_size])
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 
-# ==============================================================================
-# 【核心创新模块】Anisotropic Spatial Attention (ASA)
-# ==============================================================================
 class AnisotropicSpatialAttention(nn.Module):
     """
     各向异性空间注意力模块 (Anisotropic Spatial Attention, ASA)
@@ -156,12 +163,9 @@ class AnisotropicSpatialAttention(nn.Module):
         attention_map = torch.cat([avg_out, max_out], dim=1)
         attention_map = self.fusion_conv(attention_map)
 
-        return x * self.sigmoid(attention_map)
+        return self.sigmoid(attention_map)
 
 
-# ==============================================================================
-# SE Attention Module
-# ==============================================================================
 class SEBlock(nn.Module):
     """Squeeze-and-Excitation Block"""
     def __init__(self, channels, r=16):
@@ -181,9 +185,6 @@ class SEBlock(nn.Module):
         return x * y
 
 
-# ==============================================================================
-# ECA Attention Module
-# ==============================================================================
 class ECABlock(nn.Module):
     """Efficient Channel Attention Block"""
     def __init__(self, channels, k_size=3):
@@ -199,9 +200,6 @@ class ECABlock(nn.Module):
         return x * y.expand_as(x)
 
 
-# ==============================================================================
-# CBAM Attention Module
-# ==============================================================================
 class CBAM(nn.Module):
     """Convolutional Block Attention Module"""
     def __init__(self, channels, r=16):
@@ -236,6 +234,8 @@ class CBAM(nn.Module):
 # ==============================================================================
 # Attention Factory Function
 # ==============================================================================
+
+
 def build_attention(att_type, channels):
     """Factory function to build attention modules based on type"""
     if att_type == "ASA":
@@ -250,14 +250,15 @@ def build_attention(att_type, channels):
 
 
 # ==============================================================================
-# 【全新模型】LightweightVDLNet_PlacementAblation with Anisotropic Spatial Attention (ASA)
-# 用于消融实验，控制ASA模块放置位置
+# Model
 # ==============================================================================
+
+
 class LightweightVDLNet_PlacementAblation(nn.Module):
     def __init__(self, num_classes=3, attention="ASA", asa_before_pool=True):
         super(LightweightVDLNet_PlacementAblation, self).__init__()
         self.attention = attention
-        self.asa_before_pool = asa_before_pool  # 添加一个标志来控制ASA的放置位置
+        self.asa_before_pool = asa_before_pool
 
         # --- Block 1 ---
         self.block1_conv = nn.Sequential(
@@ -290,41 +291,52 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         self.att1 = build_attention(self.attention, 32)
         self.att2 = build_attention(self.attention, 64)
         self.att3 = build_attention(self.attention, 128)
-        
+
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        # 注意：这里的输入特征数要根据最终特征图的通道数确定
         self.classifier = nn.Sequential(
-            nn.Linear(128, 64),  # 从128维降到64维
+            nn.Linear(128, 64),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),  # 加入Dropout增强正则化
+            nn.Dropout(0.5),
             nn.Linear(64, num_classes)
         )
+
+    def apply_attention(self, x, att_module):
+        """Apply attention module uniformly.
+        
+        For ASA: returns attention map [B,1,H,W], then applies residual weighting: x + x * attn
+        For SE/ECA/CBAM/Identity: returns weighted feature map directly [B,C,H,W]
+        """
+        if self.attention == "ASA":
+            attn = att_module(x)  # [B,1,H,W] attention map
+            return x + x * attn.expand_as(x)  # residual ASA
+        else:
+            return att_module(x)  # SE/ECA/CBAM/Identity - returns weighted features
 
     def forward(self, x):
         # --- Block 1 ---
         x = self.block1_conv(x)
         if self.asa_before_pool:
-            x = self.att1(x)
+            x = self.apply_attention(x, self.att1)
         x = self.block1_pool(x)
         if not self.asa_before_pool:
-            x = self.att1(x)
+            x = self.apply_attention(x, self.att1)
 
         # --- Block 2 ---
         x = self.block2_conv(x)
         if self.asa_before_pool:
-            x = self.att2(x)
+            x = self.apply_attention(x, self.att2)
         x = self.block2_pool(x)
         if not self.asa_before_pool:
-            x = self.att2(x)
+            x = self.apply_attention(x, self.att2)
 
         # --- Block 3 ---
         x = self.block3_conv(x)
         if self.asa_before_pool:
-            x = self.att3(x)
+            x = self.apply_attention(x, self.att3)
         x = self.block3_pool(x)
         if not self.asa_before_pool:
-            x = self.att3(x)
-        
+            x = self.apply_attention(x, self.att3)
+
         # --- Classifier ---
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
@@ -332,12 +344,185 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         return x
 
 
+# ==============================================================================
+# Data / Loss / Train Helpers
+# ==============================================================================
+
+
+def get_transform():
+    return transforms.Compose([transforms.Resize(IMAGE_SIZE), transforms.ToTensor()])
+
+
+def get_all_wells(root_dir):
+    wells = sorted([w for w in os.listdir(root_dir) if is_valid_well_dir(root_dir, w)])
+    return wells
+
+
+def build_loader(dataset, is_train):
+    if is_train and USE_WEIGHTED_SAMPLER:
+        labels = np.array([dataset[i][1] for i in range(len(dataset))])
+        classes, counts = np.unique(labels, return_counts=True)
+        class_weights_for_sampler = {c: 1.0 / cnt for c, cnt in zip(classes, counts)}
+        sample_weights = np.array([class_weights_for_sampler[l] for l in labels])
+        sampler = torch.utils.data.WeightedRandomSampler(
+            torch.from_numpy(sample_weights).float(),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=BATCH_SIZE,
+            sampler=sampler,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+        )
+
+    return DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=is_train,
+        num_workers=NUM_WORKERS,
+        pin_memory=True,
+    )
+
+
+def compute_class_weights(dataset):
+    labels = [dataset[i][1] for i in range(len(dataset))]
+    classes = np.unique(labels)
+    weights = compute_class_weight(class_weight="balanced", classes=classes, y=labels)
+    # align to full class index [0, 1, 2]
+    full_weights = np.ones(NUM_CLASSES, dtype=np.float32)
+    for cls_idx, cls_weight in zip(classes, weights):
+        full_weights[int(cls_idx)] = cls_weight
+    return torch.tensor(full_weights, dtype=torch.float32, device=device)
+
+
+def evaluate(model, loader, criterion_cls):
+    """Evaluate model on given dataloader and return metrics."""
+    model.eval()
+    total_loss = 0.0
+    all_preds, all_labels, all_probs = [], [], []
+
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            loss = criterion_cls(outputs, labels)
+            total_loss += loss.item()
+
+            preds = outputs.argmax(dim=1)
+            probs = torch.softmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    avg_loss = total_loss / max(1, len(loader))
+    acc = 100.0 * (np.array(all_preds) == np.array(all_labels)).mean() if all_labels else 0.0
+    return {
+        "loss": avg_loss,
+        "acc": acc,
+        "preds": all_preds,
+        "labels": all_labels,
+        "probs": all_probs,
+    }
+
+
+def train_one_fold(train_loader, val_loader, fixed_epochs, attention_type):
+    """Train model for a fixed number of epochs (no early stopping)."""
+    model = LightweightVDLNet_PlacementAblation(
+        num_classes=NUM_CLASSES,
+        attention=attention_type,
+        asa_before_pool=True,
+    ).to(device)
+
+    class_weights = compute_class_weights(train_loader.dataset) if USE_CLASS_WEIGHT_IN_LOSS else None
+    criterion_cls = nn.CrossEntropyLoss(weight=class_weights)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=6, min_lr=1e-10)
+
+    epoch_metrics = []
+
+    for epoch in range(fixed_epochs):
+        model.train()
+        train_loss = 0.0
+
+        loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{fixed_epochs}", leave=False)
+        for inputs, labels in loop:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion_cls(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item()
+            loop.set_postfix(train_loss=f"{train_loss / max(1, len(train_loader)):.4f}")
+
+        val_result = evaluate(model, val_loader, criterion_cls)
+        scheduler.step(val_result["loss"])
+
+        epoch_metrics.append(
+            {
+                "epoch": epoch + 1,
+                "val_loss": val_result["loss"],
+                "val_acc": val_result["acc"],
+            }
+        )
+
+    return {
+        "epoch_metrics": epoch_metrics,
+    }
+
+
+def inner_loo_select_best_epoch(outer_train_wells, transform, fixed_epochs, attention_type):
+    """Select best epoch using inner leave-one-well-out."""
+    inner_histories = []
+
+    for inner_val_well in outer_train_wells:
+        inner_train_wells = [w for w in outer_train_wells if w != inner_val_well]
+
+        train_ds = CementVDLDataset(DATA_DIR, transform=transform, selected_wells=inner_train_wells)
+        val_ds = CementVDLDataset(DATA_DIR, transform=transform, selected_wells=[inner_val_well])
+
+        if len(train_ds) == 0 or len(val_ds) == 0:
+            raise RuntimeError(
+                f"Inner fold has empty dataset. train={inner_train_wells}, val={[inner_val_well]}"
+            )
+
+        train_loader = build_loader(train_ds, is_train=True)
+        val_loader = build_loader(val_ds, is_train=False)
+
+        print(f"  Inner fold: train={inner_train_wells}, val={[inner_val_well]}")
+        fold_result = train_one_fold(train_loader, val_loader, fixed_epochs=fixed_epochs, attention_type=attention_type)
+        inner_histories.append(pd.DataFrame(fold_result["epoch_metrics"]))
+
+    merged = inner_histories[0][["epoch"]].copy()
+    merged["mean_val_acc"] = 0.0
+    merged["mean_val_loss"] = 0.0
+
+    for hist in inner_histories:
+        merged["mean_val_acc"] += hist["val_acc"]
+        merged["mean_val_loss"] += hist["val_loss"]
+
+    merged["mean_val_acc"] /= len(inner_histories)
+    merged["mean_val_loss"] /= len(inner_histories)
+
+    # primary criterion: highest mean val acc; tie-breaker: lower mean val loss
+    best_row = merged.sort_values(["mean_val_acc", "mean_val_loss"], ascending=[False, True]).iloc[0]
+    best_epoch = int(best_row["epoch"])
+
+    return best_epoch, merged
+
+
 def plot_precision_recall_curve(y_true, y_probs, num_classes, label_names, title, save_path):
     plt.figure(figsize=(10, 8))
     for i in range(num_classes):
-        # 获取当前类别的真实标签 (one-hot编码)
         y_true_class = (np.array(y_true) == i).astype(int)
-        # 获取当前类别的预测概率
         y_score_class = np.array(y_probs)[:, i]
 
         precision, recall, _ = precision_recall_curve(
@@ -355,319 +540,186 @@ def plot_precision_recall_curve(y_true, y_probs, num_classes, label_names, title
     plt.close()
 
 
-# ==============================================================================
-# 模型、损失函数和优化器初始化 (Initialization)
-# ==============================================================================
-# ==============================================================================
-# Attention Configuration
-# ==============================================================================
-# Options: "ASA", "SE", "ECA", "CBAM", None
-# 修改这个参数来运行不同的消融实验
-# 修改这里来实例化新的模型类并控制attention type
-model = LightweightVDLNet_PlacementAblation(num_classes=3, attention=ATTENTION, asa_before_pool=True)
-print(f"Using attention type: {ATTENTION}")
+def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, best_epoch, attention_type):
+    """Train final model on all outer_train_wells and test on outer_test_well."""
+    train_ds = CementVDLDataset(DATA_DIR, transform=transform, selected_wells=outer_train_wells)
+    test_ds = CementVDLDataset(DATA_DIR, transform=transform, selected_wells=[outer_test_well])
 
-# 示例：测试不同attention type（只需修改 ATTENTION 参数即可）
-# ATTENTION = None  # Baseline
-# ATTENTION = "SE"
-# ATTENTION = "ECA"
-# ATTENTION = "CBAM"
-# ATTENTION = "ASA"
+    if len(train_ds) == 0 or len(test_ds) == 0:
+        raise RuntimeError(
+            f"Outer fold has empty dataset. train={outer_train_wells}, test={[outer_test_well]}"
+        )
 
+    train_loader = build_loader(train_ds, is_train=True)
+    test_loader = build_loader(test_ds, is_train=False)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(device)
-print("="*60)
-print(f"Model Architecture: LightweightVDLNet with {ATTENTION} attention")
-print("="*60)
-print(model)
+    # final training: no validation split, train exactly best_epoch rounds
+    model = LightweightVDLNet_PlacementAblation(
+        num_classes=NUM_CLASSES,
+        attention=attention_type,
+        asa_before_pool=True,
+    ).to(device)
 
-# 计算类别权重以处理数据不平衡问题
-labels_array = [label for _, label in full_dataset.samples]
-class_weights_np = compute_class_weight(
-    class_weight='balanced', classes=np.unique(labels_array), y=labels_array)
-class_weights = torch.tensor(
-    class_weights_np, dtype=torch.float32, device=device)
-criterion = nn.CrossEntropyLoss(weight=class_weights)
+    class_weights = compute_class_weights(train_ds) if USE_CLASS_WEIGHT_IN_LOSS else None
+    criterion_cls = nn.CrossEntropyLoss(weight=class_weights)
 
-# 优化器中增加权重衰减 (Weight Decay)
-optimizer = torch.optim.AdamW(
-    model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)  # 增加权重衰减
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
 
-# 引入学习率调度器 (ReduceLROnPlateau)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, mode='min', factor=0.5, patience=6, min_lr=1e-10)
+    print(f"  Final outer training for {best_epoch} epochs on wells={outer_train_wells}")
+    for epoch in range(best_epoch):
+        model.train()
+        loop = tqdm(train_loader, desc=f"Final train epoch {epoch + 1}/{best_epoch}", leave=False)
 
-# ==============================================================================
-# 训练与验证循环 (Training & Validation Loop)
-# ==============================================================================
+        for inputs, labels in loop:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
 
-train_acc_history, val_acc_history = [], []
-train_loss_history, val_loss_history = [], []
-best_val_loss = float('inf')  # 记录最佳验证损失
-patience_counter = 0  # 早停计数器
-best_model_wts = None  # 用于保存最佳模型权重
-best_val_preds, best_val_labels, best_val_probs = [], [], []  # 存储最佳模型在验证集上的结果
-
-print("\nStarting training with LightweightVDLNet_PlacementAblation...")
-for epoch in range(EPOCHS):
-    model.train()
-    train_loss, train_correct, train_total = 0, 0, 0
-    train_loader_tqdm = tqdm(
-        train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} Training")
-    for inputs, labels in train_loader_tqdm:
-        inputs, labels = inputs.to(device), labels.to(device)
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        train_loss += loss.item()
-        _, predicted = torch.max(outputs.data, 1)
-        train_total += labels.size(0)
-        train_correct += (predicted == labels).sum().item()
-        train_loader_tqdm.set_postfix(
-            loss=train_loss/len(train_loader_tqdm), acc=100. * train_correct / train_total)
-
-    # --- 验证 ---
-    val_loss, val_correct, val_total = 0, 0, 0
-    current_val_preds, current_val_labels = [], []
-    current_val_probs = []  # 用于PR曲线的预测分数
-    model.eval()
-    val_loader_tqdm = tqdm(
-        val_loader, desc=f"Epoch {epoch+1}/{EPOCHS} Validation")
-    with torch.no_grad():
-        for inputs, labels in val_loader_tqdm:
-            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            val_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
+            loss = criterion_cls(outputs, labels)
+            loss.backward()
+            optimizer.step()
 
-            # 收集概率 (Softmax用于将logits转换为概率)
-            probabilities = torch.softmax(outputs, dim=1)
-            current_val_probs.extend(probabilities.cpu().numpy())
+    # 保存模型
+    model_path = f"model_outer_{outer_test_well}_{attention_type}.pt"
+    torch.save(model.state_dict(), model_path)
+    print(f"Saved model: {model_path}")
 
-            val_total += labels.size(0)
-            val_correct += (predicted == labels).sum().item()
-            current_val_preds.extend(predicted.cpu().numpy())
-            current_val_labels.extend(labels.cpu().numpy())
-            val_loader_tqdm.set_postfix(
-                loss=val_loss/len(val_loader_tqdm), acc=100. * val_correct / val_total)
+    test_result = evaluate(model, test_loader, criterion_cls)
+    report_text = classification_report(
+        test_result["labels"],
+        test_result["preds"],
+        target_names=label_names,
+        zero_division=0,
+        digits=5,
+    )
+    cm = confusion_matrix(test_result["labels"], test_result["preds"], labels=[0, 1, 2])
 
-    avg_val_loss = val_loss / len(val_loader)
-    train_acc = 100 * train_correct / train_total
-    val_acc = 100 * val_correct / val_total
-    train_acc_history.append(train_acc)
-    val_acc_history.append(val_acc)
+    # 保存分类报告
+    report_path = f"classification_report_test_outer_{outer_test_well}_{attention_type}.csv"
+    report_dict = classification_report(
+        test_result["labels"],
+        test_result["preds"],
+        target_names=label_names,
+        output_dict=True,
+        zero_division=0,
+        digits=5,
+    )
+    pd.DataFrame(report_dict).transpose().to_csv(report_path, index=True)
+    print(f"Saved classification report: {report_path}")
 
-    train_loss_history.append(train_loss / len(train_loader))
-    val_loss_history.append(avg_val_loss)
+    # 保存混淆矩阵
+    cm_path = f"confusion_matrix_test_outer_{outer_test_well}_{attention_type}.png"
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=label_names)
+    disp.plot(cmap=plt.cm.Oranges)
+    plt.title(f"Confusion Matrix on Test Set - {outer_test_well} ({attention_type})")
+    plt.savefig(cm_path)
+    plt.close()
+    print(f"Saved confusion matrix: {cm_path}")
 
-    print(f"Epoch {epoch+1}/{EPOCHS}, Train Loss: {train_loss/len(train_loader):.4f}, Train Acc: {train_acc:.2f}%, Val Loss: {avg_val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+    # 保存 PR 曲线
+    pr_path = f"pr_curve_test_outer_{outer_test_well}_{attention_type}.png"
+    plot_precision_recall_curve(
+        test_result["labels"],
+        test_result["probs"],
+        NUM_CLASSES,
+        label_names,
+        f"Precision-Recall Curve on Test Set - {outer_test_well} ({attention_type})",
+        pr_path
+    )
+    print(f"Saved PR curve: {pr_path}")
 
-    # 学习率调度器步进
-    scheduler.step(avg_val_loss)
-
-    # 获取并打印当前学习率
-    current_lr = optimizer.param_groups[0]['lr']
-    print(f"Current Learning Rate: {current_lr:.7e}")  # 打印学习率
-
-    # 步骤一：最佳模型保存和早停机制
-    if avg_val_loss < best_val_loss - MIN_DELTA:  # 只有当验证损失有显著降低时才更新
-        best_val_loss = avg_val_loss
-        best_model_wts = copy.deepcopy(model.state_dict())  # 深拷贝当前模型权重
-        patience_counter = 0  # 重置耐心计数器
-        # 同时保存最佳模型在验证集上的预测结果
-        best_val_preds = current_val_preds
-        best_val_labels = current_val_labels
-        best_val_probs = current_val_probs
-        print(
-            f"Validation loss improved. Saving best model to {BEST_MODEL_SAVE_PATH}")
-        torch.save(model.state_dict(), BEST_MODEL_SAVE_PATH)  # 保存最佳模型
-    else:
-        patience_counter += 1
-        print(
-            f"Validation loss did not improve. Patience: {patience_counter}/{PATIENCE}")
-        if patience_counter >= PATIENCE:
-            print(f"Early stopping triggered after {epoch+1} epochs.")
-            break  # 触发早停，终止训练
-
-# 验证集分类报告（使用最佳模型在验证集上的表现）
-if best_model_wts:
-    print(f"\nGenerating Validation Set Classification Report based on Best Model...")
-    report_val_str = classification_report(
-        best_val_labels, best_val_preds, target_names=label_names, zero_division=0, digits=5)
-    print(
-        f"\nValidation Set Classification Report (Best Model):\n{report_val_str}")
-    report_val_dict = classification_report(
-        best_val_labels, best_val_preds, target_names=label_names, output_dict=True, zero_division=0, digits=5)
-    pd.DataFrame(report_val_dict).transpose().to_csv(
-        "classification_report_val_resnet18_asa.csv", index=True)
-    print(f"Validation set classification report saved to classification_report_val_resnet18_asa.csv")
-else:
-    # 如果没有早停（例如EPOCHS设置得很小），就用最后一个epoch的验证结果
-    print(f"\nGenerating Validation Set Classification Report based on Final Model (No Early Stop)...")
-    report_val_str = classification_report(
-        current_val_labels, current_val_preds, target_names=label_names, zero_division=0, digits=5)
-    print(
-        f"\nValidation Set Classification Report (Final Model):\n{report_val_str}")
-    report_val_dict = classification_report(
-        current_val_labels, current_val_preds, target_names=label_names, output_dict=True, zero_division=0, digits=5)
-    pd.DataFrame(report_val_dict).transpose().to_csv(
-        "classification_report_val_resnet18_asa.csv", index=True)
-    print(f"Validation set classification report saved to classification_report_val_resnet18_asa.csv")
-
-# ==============================================================================
-# 保存与评估 (Save & Evaluate)
-# ==============================================================================
-
-# 如果有最佳模型，加载最佳模型进行最终评估
-if best_model_wts:
-    model.load_state_dict(best_model_wts)
-    print(
-        f"\nLoaded best model from {BEST_MODEL_SAVE_PATH} for final evaluation.")
-else:
-    # 如果没有早停，也保存最后一次训练的模型
-    torch.save(model.state_dict(), MODEL_SAVE_PATH)
-    print(f"\nNo early stopping, saving final model to {MODEL_SAVE_PATH}")
-
-
-plt.figure(figsize=(12, 10))  # Adjust figure size for two subplots
-plt.subplot(2, 1, 1)  # First subplot for accuracy
-
-plt.plot(train_acc_history, label="training accuracy",
-         marker='o', linestyle='-')
-plt.plot(val_acc_history, label="validation accuracy",
-         marker='x', linestyle='--')
-plt.xlabel("Epoch")
-plt.ylabel("Accuracy (%)")
-plt.title("Training & Validation Accuracy (LightweightVDLNet_PlacementAblation)")
-plt.legend()
-plt.grid(True)
-
-plt.subplot(2, 1, 2)  # Second subplot for loss
-
-plt.plot(train_loss_history, label="training loss", marker='o', linestyle='-')
-plt.plot(val_loss_history, label="validation loss", marker='x', linestyle='--')
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.title("Training & Validation Loss (LightweightVDLNet_PlacementAblation)")
-plt.legend()
-plt.grid(True)
-
-plt.tight_layout()  # Adjust layout to prevent overlapping
-plt.savefig(ACC_PLOT_PATH)
-plt.close()
-print(f"Accuracy and Loss curves saved to {ACC_PLOT_PATH}")
-
-# 绘制验证集混淆矩阵（基于最佳模型所在的epoch的数据）
-cm = confusion_matrix(best_val_labels if best_model_wts else current_val_labels,
-                      best_val_preds if best_model_wts else current_val_preds)
-disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=label_names)
-disp.plot(cmap=plt.cm.Blues)
-plt.title("Confusion Matrix on Validation Set (LightweightVDLNet_PlacementAblation)")
-plt.savefig(CONFUSION_PATH)
-plt.close()
-
-
-# 绘制验证集Precision-Recall曲线
-plot_precision_recall_curve(
-    best_val_labels if best_model_wts else current_val_labels,
-    best_val_probs if best_model_wts else current_val_probs,
-    NUM_CLASSES, label_names,
-    "Precision-Recall Curve on Validation Set (LightweightVDLNet_PlacementAblation)",
-    "pr_curve_val_resnet18_asa.png"
-)
-
-
-# 测试集评估
-model.eval()
-test_preds, test_labels = [], []
-all_test_probs = []  # 用于PR曲线的预测分数
-with torch.no_grad():
-    for inputs, labels in test_loader:
-        inputs, labels = inputs.to(device), labels.to(device)
-        outputs = model(inputs)
-        _, predicted = torch.max(outputs.data, 1)
-        # 收集概率
-        probabilities = torch.softmax(outputs, dim=1)
-        all_test_probs.extend(probabilities.cpu().numpy())
-
-        test_preds.extend(predicted.cpu().numpy())
-        test_labels.extend(labels.cpu().numpy())
-
-
-# 测试集分类报告
-report_test_str = classification_report(
-    test_labels, test_preds, target_names=label_names, zero_division=0, digits=5)
-print(f"\nTest Set Classification Report:\n{report_test_str}")
-report_test_dict = classification_report(
-    test_labels, test_preds, target_names=label_names, output_dict=True, zero_division=0, digits=5)
-pd.DataFrame(report_test_dict).transpose().to_csv(
-    "classification_report_test_resnet18_asa.csv", index=True)
-print(f"Test set classification report saved to classification_report_test_resnet18_asa.csv")
-
-cm_test = confusion_matrix(test_labels, test_preds)
-disp_test = ConfusionMatrixDisplay(
-    confusion_matrix=cm_test, display_labels=label_names)
-disp_test.plot(cmap=plt.cm.Oranges)
-plt.title("Confusion Matrix on Test Set (LightweightVDLNet_PlacementAblation)")
-plt.savefig(CONFUSION_TEST_PATH)
-plt.close()
-
-
-# 绘制测试集Precision-Recall曲线
-plot_precision_recall_curve(
-    test_labels, all_test_probs, NUM_CLASSES, label_names,
-    "Precision-Recall Curve on Test Set (LightweightVDLNet_PlacementAblation)",
-    "pr_curve_test_resnet18_asa.png"
-)
-
-
-test_correct = sum(p == t for p, t in zip(test_preds, test_labels))
-test_total = len(test_labels)
-test_acc = 100 * test_correct / test_total
-print(f"Final Test Accuracy (LightweightVDLNet_PlacementAblation): {test_acc:.2f}%")
-print("Training and evaluation complete.")
-
+    return {
+        "test_acc": test_result["acc"],
+        "test_loss": test_result["loss"],
+        "report_text": report_text,
+        "confusion_matrix": cm,
+    }
 
 
 # ==============================================================================
-# 导出模型为 ONNX 格式 (Export Model to ONNX)
+# Main: Two-level LOO
 # ==============================================================================
-print("\nAttempting to export model to ONNX format...")
-try:
-    # 加载最佳模型（如果有的话）
-    if best_model_wts:
-        model.load_state_dict(best_model_wts)
-        print("Loaded best model weights for ONNX export.")
-    else:
-        print("Using final model weights for ONNX export.")
 
-    model.eval() # 确保模型处于评估模式
 
-    # 创建一个与模型输入尺寸匹配的虚拟输入
-    # IMAGE_SIZE (500, 40) 是 (H, W)，模型期望 (N, C, H, W)
-    # N=1 (batch size 1), C=1 (灰度图)
-    dummy_input = torch.randn(1, 1, IMAGE_SIZE[0], IMAGE_SIZE[1]).to(device)
+def main():
+    transform = get_transform()
+    all_wells = get_all_wells(DATA_DIR)
 
-    onnx_model_path = "lightweight_vdl_net_asa.onnx" # 定义ONNX文件路径
-    torch.onnx.export(model,                    # 运行的模型
-                      dummy_input,               # 模型的一个示例输入 (会根据这个输入追踪计算图)
-                      onnx_model_path,           # 模型保存路径
-                      export_params=True,        # 导出训练好的参数
-                      opset_version=11,          # ONNX操作集版本
-                      do_constant_folding=True,  # 是否执行常量折叠优化
-                      input_names=['input'],     # 输入名称
-                      output_names=['output'],   # 输出名称
-                      dynamic_axes={'input': {0: 'batch_size'},    # 声明动态批处理大小
-                                    'output': {0: 'batch_size'}})
-    print(f"Model successfully exported to ONNX format at: {onnx_model_path}")
-    print("You can now open this .onnx file with Netron for visualization.")
+    if len(all_wells) < 3:
+        raise RuntimeError(
+            "Two-level LOO needs at least 3 wells: one outer test + at least two outer-train wells."
+        )
 
-except Exception as e:
-    print(f"Error exporting model to ONNX: {e}")
-    print("Please ensure your dummy_input matches the model's expected input shape.")
+    print("="*90)
+    print(f"Attention Ablation Study with Two-Level Leave-One-Well-Out")
+    print(f"Attention Type: {ATTENTION}")
+    print(f"Detected wells: {all_wells}")
+    print(f"Device: {device}")
+    print(f"Config: INNER_EPOCHS={INNER_EPOCHS}, LEARNING_RATE={LEARNING_RATE}")
+    print(f"USE_WEIGHTED_SAMPLER={USE_WEIGHTED_SAMPLER}, USE_CLASS_WEIGHT_IN_LOSS={USE_CLASS_WEIGHT_IN_LOSS}")
+    print("="*90)
 
-print("All tasks complete.")
+    if USE_WEIGHTED_SAMPLER and USE_CLASS_WEIGHT_IN_LOSS:
+        raise RuntimeError(
+            "Both weighted sampler and weighted classification loss are enabled. "
+            "Disable one to avoid double class reweighting."
+        )
+
+    outer_results = []
+
+    for outer_test_well in all_wells:
+        print("\n" + "=" * 90)
+        print(f"Outer fold start: test well = {outer_test_well}")
+        outer_train_wells = [w for w in all_wells if w != outer_test_well]
+        print(f"Outer train wells: {outer_train_wells}")
+
+        best_epoch, inner_curve = inner_loo_select_best_epoch(
+            outer_train_wells=outer_train_wells,
+            transform=transform,
+            fixed_epochs=INNER_EPOCHS,
+            attention_type=ATTENTION,
+        )
+        print(f"Selected best epoch for outer test={outer_test_well}: {best_epoch}")
+
+        inner_curve_path = f"inner_curve_outer_test_{outer_test_well}_{ATTENTION}.csv"
+        inner_curve.to_csv(inner_curve_path, index=False)
+        print(f"Saved inner-LOO epoch curve: {inner_curve_path}")
+
+        final_result = train_full_outer_and_test(
+            outer_train_wells=outer_train_wells,
+            outer_test_well=outer_test_well,
+            transform=transform,
+            best_epoch=best_epoch,
+            attention_type=ATTENTION,
+        )
+
+        print(f"Outer test acc ({outer_test_well}): {final_result['test_acc']:.2f}%")
+        print("Outer test classification report:")
+        print(final_result["report_text"])
+        print("Outer test confusion matrix:")
+        print(final_result["confusion_matrix"])
+
+        outer_results.append(
+            {
+                "outer_test_well": outer_test_well,
+                "outer_train_wells": ",".join(outer_train_wells),
+                "best_epoch": best_epoch,
+                "test_acc": final_result["test_acc"],
+                "test_loss": final_result["test_loss"],
+            }
+        )
+
+    results_df = pd.DataFrame(outer_results)
+    results_path = f"outer_loo_results_attention_{ATTENTION}.csv"
+    results_df.to_csv(results_path, index=False)
+
+    print("\n" + "=" * 90)
+    print("Two-level LOO complete.")
+    print(results_df)
+    print(f"Mean outer test acc: {results_df['test_acc'].mean():.2f}%")
+    print(f"Saved summary to {results_path}")
+
+
+if __name__ == "__main__":
+    main()
