@@ -15,6 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+import time
 
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.utils.class_weight import compute_class_weight
@@ -31,9 +32,11 @@ NUM_CLASSES = 3
 LEARNING_RATE = 2e-5
 IMAGE_SIZE = (500, 40)
 INNER_EPOCHS = 50
-LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 5.0))
+LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.1))  # 建议范围: 0.001~0.1
 USE_ASA = True
 USE_WEIGHTED_SAMPLER = True
+EMA_DECAY = 0.99  # EMA teacher 衰减率
+WARMUP_EPOCHS = 3  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训练分类
 USE_CLASS_WEIGHT_IN_LOSS = False
 USE_FOCAL_LOSS = False
 FOCAL_GAMMA = 2.0
@@ -327,6 +330,31 @@ def build_loader(dataset, is_train):
     )
 
 
+def build_ema_teacher(student_model):
+    """构建 EMA teacher 模型（student 的副本，冻结参数）"""
+    teacher_model = copy.deepcopy(student_model)
+    teacher_model.eval()
+    for p in teacher_model.parameters():
+        p.requires_grad = False
+    return teacher_model
+
+
+def update_ema_teacher(student_model, teacher_model, ema_decay):
+    """更新 EMA teacher 参数和 BN buffers: θ_teacher = α * θ_teacher + (1-α) * θ_student"""
+    with torch.no_grad():
+        # 更新参数 (weights & biases)
+        for t_param, s_param in zip(teacher_model.parameters(), student_model.parameters()):
+            t_param.data.mul_(ema_decay).add_(s_param.data, alpha=1.0 - ema_decay)
+
+        # 更新 BN buffers (running_mean, running_var)
+        # 注意：只对浮点型 buffer 做 EMA，非浮点 buffer（如 num_batches_tracked）直接 copy
+        for t_buffer, s_buffer in zip(teacher_model.buffers(), student_model.buffers()):
+            if t_buffer.dtype.is_floating_point:
+                t_buffer.data.mul_(ema_decay).add_(s_buffer.data, alpha=1.0 - ema_decay)
+            else:
+                t_buffer.data.copy_(s_buffer.data)
+
+
 def compute_class_weights(dataset):
     labels = [dataset[i][1] for i in range(len(dataset))]
     classes = np.unique(labels)
@@ -365,9 +393,14 @@ def evaluate(model, loader, criterion_cls):
     }
 
 
-def training_step(model, inputs, labels, optimizer, criterion_cls, criterion_guide, lambda_guidance):
+def count_parameters(model):
+    """统计模型可训练参数数量"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def training_step(student_model, teacher_model, inputs, labels, optimizer, criterion_cls, lambda_guidance):
     """
-    统一的训练步骤：student forward + 可选的 reference/teacher forward for GGAS
+    统一的训练步骤：student forward + EMA teacher forward for GGAS
 
     返回: (total_loss, l_cls, l_guide)
     """
@@ -375,33 +408,43 @@ def training_step(model, inputs, labels, optimizer, criterion_cls, criterion_gui
     labels = labels.to(device)
 
     # === student 分支：根据 USE_ASA 决定是否开启 ASA ===
-    outputs, feat2_s, attn2_s = model(
+    outputs, feat2_s, attn2_s = student_model(
         inputs,
         enable_asa=USE_ASA,
         return_guidance=True
     )
     l_cls = criterion_cls(outputs, labels)
 
-    # === teacher/reference 分支：关闭 ASA，生成 Grad-CAM 指导图 G ===
+    # === teacher 分支：使用 EMA teacher 生成 Grad-CAM 指导图 G ===
     # 只有当 LAMBDA_GUIDANCE > 0 且 USE_ASA=True 时才计算 guidance
     l_guide = torch.tensor(0.0, device=device)
+    conf_mask = torch.tensor(0.0, device=device)
 
     if lambda_guidance > 0 and USE_ASA:
         if attn2_s is None:
             raise RuntimeError("attn2_s is None. USE_ASA=True 时应当产生 ASA2 注意力。")
 
-        # 保存当前训练状态，防止 BN 被 reference path 污染
-        was_training = model.training
-        model.eval()
+        # 使用 EMA teacher（关闭 ASA）生成 Grad-CAM 目标
+        # 关键修复：创建 requires_grad=True 的输入副本，确保 feat2_t 能够正确进入可求导图
+        inputs_t = inputs.detach().requires_grad_(True)
+        teacher_model.eval()
+        logits_t, feat2_t, _ = teacher_model(
+            inputs_t,
+            enable_asa=False,
+            return_guidance=True
+        )
 
-        # 关闭 ASA 生成 teacher logits (Grad-CAM 目标)
-        logits_t, feat2_t, _ = model(inputs, enable_asa=False, return_guidance=True)
+        # ===== 改进 1: 使用 teacher 预测的类别而不是真实标签 =====
+        # 这样 CAM 来自 teacher 当前最 confident 的类别，避免早期被错误标签结构干扰
+        pred_classes = logits_t.argmax(dim=1)
+        target_scores_t = logits_t.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
 
-        model.train(was_training)
+        # ===== 可选: 置信度过滤 =====
+        # 只对高置信度样本加强监督，低置信度样本不强监督
+        conf = torch.softmax(logits_t, dim=1).max(dim=1)[0]
+        conf_mask = (conf > 0.5).float()  # 置信度 > 50% 才计算 guide loss
 
-        # 用真实标签算 teacher logits 的目标分数
-        target_scores_t = logits_t.gather(1, labels.unsqueeze(1)).squeeze(1)
-
+        # 计算 Grad-CAM（不对 teacher forward 包 no_grad，因为需要 grad）
         gradients = torch.autograd.grad(
             outputs=target_scores_t.sum(),
             inputs=feat2_t,
@@ -413,19 +456,38 @@ def training_step(model, inputs, labels, optimizer, criterion_cls, criterion_gui
         guidance_map_G = torch.sum(weights * feat2_t, dim=1, keepdim=True)
         guidance_map_G = F.relu(guidance_map_G)
 
-        # normalize 到 [0,1]
-        b = guidance_map_G.shape[0]
-        g_flat = guidance_map_G.view(b, -1)
-        g_min = g_flat.min(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-        g_max = g_flat.max(dim=1, keepdim=True)[0].view(b, 1, 1, 1)
-        guidance_map_G = (guidance_map_G - g_min) / (g_max - g_min + 1e-8)
+        # 改进的归一化：除以 mean（保持相对结构），加 clamp 防止极端值
+        g_mean = guidance_map_G.mean(dim=(2, 3), keepdim=True)
+        guidance_map_G = guidance_map_G / (g_mean + 1e-6)
+        guidance_map_G = guidance_map_G.clamp(max=5.0)
 
         # 尺寸安全检查
         assert guidance_map_G.shape == attn2_s.shape, \
             f"Shape mismatch: guidance_map_G {guidance_map_G.shape} vs attn2_s {attn2_s.shape}"
 
-        # 用 MSE 监督 ASA 生成的注意力 attn2_s 去匹配 guidance_map_G
-        l_guide = criterion_guide(attn2_s, guidance_map_G.detach())
+        # ===== 改进 2: 使用 KL divergence 匹配空间分布而不是 MSE 匹配绝对值 =====
+        # 将 attention 和 guidance map 转为概率分布，然后计算 KL divergence
+        b = attn2_s.shape[0]
+
+        # flatten spatial dimensions
+        attn_flat = attn2_s.view(b, -1)
+        g_flat = guidance_map_G.view(b, -1)
+
+        # 转成概率分布 (softmax over spatial dimensions)
+        attn_prob = F.softmax(attn_flat, dim=1)
+        g_prob = F.softmax(g_flat, dim=1)
+
+        # KL divergence: KL(student || teacher) - student 分布去逼近 teacher 分布
+        # 重要：detach 的是 teacher 目标 g_prob，保留 student attn_prob 以获得梯度
+        # 方向：log(attn_prob) 是 input，g_prob 是 target
+        guide_raw = F.kl_div(
+            torch.log(attn_prob + 1e-8),
+            g_prob.detach(),
+            reduction="none"
+        ).sum(dim=1)
+
+        # 使用 conf_mask 过滤低置信度样本，并用 sum/denom 避免被 0 稀释
+        l_guide = (guide_raw * conf_mask).sum() / (conf_mask.sum() + 1e-6)
 
     total_loss = l_cls + lambda_guidance * l_guide
 
@@ -433,7 +495,10 @@ def training_step(model, inputs, labels, optimizer, criterion_cls, criterion_gui
     total_loss.backward()
     optimizer.step()
 
-    return total_loss, l_cls, l_guide
+    # 更新 EMA teacher（无条件更新，确保 warmup 期间 teacher 也会跟随 student 更新）
+    update_ema_teacher(student_model, teacher_model, EMA_DECAY)
+
+    return total_loss, l_cls.detach(), l_guide.detach(), conf_mask.mean().detach()
 
 
 def train_with_guidance(train_loader, val_loader, fixed_epochs):
@@ -443,6 +508,9 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
         asa_before_pool=True,
     ).to(device)
 
+    # 创建 EMA teacher 模型
+    teacher_model = build_ema_teacher(model)
+
     class_weights = (
         compute_class_weights(train_loader.dataset) if USE_CLASS_WEIGHT_IN_LOSS else None
     )
@@ -450,7 +518,6 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
         criterion_cls = FocalLoss(gamma=FOCAL_GAMMA, weight=class_weights)
     else:
         criterion_cls = nn.CrossEntropyLoss(weight=class_weights)
-    criterion_guide = nn.MSELoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
 
@@ -462,15 +529,63 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
         model.train()
         running_loss = 0.0
 
-        loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{fixed_epochs}", leave=False)
+        # 计时与显存统计
+        torch.cuda.reset_peak_memory_stats()
+        start_time = time.time()
+
+        # 累加变量，用于统计 GGAS 信息
+        sum_cls = 0.0
+        sum_guide = 0.0
+        sum_conf = 0.0
+        num_batches = 0
+
+        # warmup: 前 WARMUP_EPOCHS 个 epoch 不启用 guidance，只训练分类
+        if epoch < WARMUP_EPOCHS:
+            effective_lambda = 0.0
+            guidance_status = "warmup"
+        else:
+            effective_lambda = LAMBDA_GUIDANCE
+            guidance_status = "active"
+
+        loop = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{fixed_epochs} (guidance: {guidance_status})", leave=False)
         for inputs, labels in loop:
-            total_loss, _, _ = training_step(
-                model, inputs, labels,
-                optimizer, criterion_cls, criterion_guide, LAMBDA_GUIDANCE
+            total_loss, l_cls, l_guide, conf_mean = training_step(
+                student_model=model,
+                teacher_model=teacher_model,
+                inputs=inputs,
+                labels=labels,
+                optimizer=optimizer,
+                criterion_cls=criterion_cls,
+                lambda_guidance=effective_lambda
             )
 
             running_loss += total_loss.item()
-            loop.set_postfix(train_loss=f"{running_loss / max(1, len(train_loader)):.4f}")
+            # 累计 GGAS 统计信息
+            sum_cls += l_cls.item()
+            sum_guide += l_guide.item()
+            sum_conf += conf_mean.item()
+            num_batches += 1
+
+            loop.set_postfix(train_loss=f"{running_loss / max(1, num_batches):.4f}")
+
+        # epoch 结束时打印 GGAS 统计信息
+        if num_batches > 0:
+            mean_cls = sum_cls / num_batches
+            mean_guide = sum_guide / num_batches
+            mean_lambda_guide = effective_lambda * mean_guide
+            mean_conf = sum_conf / num_batches
+
+            print(
+                f"[GGAS stats] "
+                f"mean_l_cls={mean_cls:.4f} "
+                f"mean_l_guide={mean_guide:.4f} "
+                f"lambda*l_guide={mean_lambda_guide:.4f} "
+                f"conf_mask_mean={mean_conf:.4f}"
+            )
+
+        # 计算训练时间和显存使用
+        epoch_time = time.time() - start_time
+        peak_mem = torch.cuda.max_memory_allocated() / 1024**3
 
         val_result = evaluate(model, val_loader, criterion_cls)
         epoch_metrics.append(
@@ -478,6 +593,8 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
                 "epoch": epoch + 1,
                 "val_loss": val_result["loss"],
                 "val_acc": val_result["acc"],
+                "time_per_epoch_sec": epoch_time,
+                "gpu_mem_gb": peak_mem
             }
         )
 
@@ -527,7 +644,7 @@ def inner_loo_select_best_epoch(outer_train_wells, transform, fixed_epochs):
     best_row = merged.sort_values(["mean_val_acc", "mean_val_loss"], ascending=[False, True]).iloc[0]
     best_epoch = int(best_row["epoch"])
 
-    return best_epoch, merged
+    return best_epoch, merged, inner_histories
 
 
 def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, best_epoch):
@@ -549,24 +666,67 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
         asa_before_pool=True,
     ).to(device)
 
+    # 创建 EMA teacher 模型
+    teacher_model = build_ema_teacher(model)
+
     class_weights = compute_class_weights(train_ds) if USE_CLASS_WEIGHT_IN_LOSS else None
     if USE_FOCAL_LOSS:
         criterion_cls = FocalLoss(gamma=FOCAL_GAMMA, weight=class_weights)
     else:
         criterion_cls = nn.CrossEntropyLoss(weight=class_weights)
-    criterion_guide = nn.MSELoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-3)
 
     print(f"  Final outer training for {best_epoch} epochs on wells={outer_train_wells}")
     for epoch in range(best_epoch):
         model.train()
-        loop = tqdm(train_loader, desc=f"Final train epoch {epoch + 1}/{best_epoch}", leave=False)
+
+        # 累加变量，用于统计 GGAS 信息
+        sum_cls = 0.0
+        sum_guide = 0.0
+        sum_conf = 0.0
+        num_batches = 0
+
+        # warmup: 前 WARMUP_EPOCHS 个 epoch 不启用 guidance，只训练分类
+        if epoch < WARMUP_EPOCHS:
+            effective_lambda = 0.0
+            guidance_status = "warmup"
+        else:
+            effective_lambda = LAMBDA_GUIDANCE
+            guidance_status = "active"
+
+        loop = tqdm(train_loader, desc=f"Final train epoch {epoch + 1}/{best_epoch} (guidance: {guidance_status})", leave=False)
 
         for inputs, labels in loop:
-            training_step(
-                model, inputs, labels,
-                optimizer, criterion_cls, criterion_guide, LAMBDA_GUIDANCE
+            total_loss, l_cls, l_guide, conf_mean = training_step(
+                student_model=model,
+                teacher_model=teacher_model,
+                inputs=inputs,
+                labels=labels,
+                optimizer=optimizer,
+                criterion_cls=criterion_cls,
+                lambda_guidance=effective_lambda
+            )
+
+            # 累计 GGAS 统计信息
+            sum_cls += l_cls.item()
+            sum_guide += l_guide.item()
+            sum_conf += conf_mean.item()
+            num_batches += 1
+
+        # epoch 结束时打印 GGAS 统计信息
+        if num_batches > 0:
+            mean_cls = sum_cls / num_batches
+            mean_guide = sum_guide / num_batches
+            mean_lambda_guide = effective_lambda * mean_guide
+            mean_conf = sum_conf / num_batches
+
+            print(
+                f"[GGAS stats] "
+                f"mean_l_cls={mean_cls:.4f} "
+                f"mean_l_guide={mean_guide:.4f} "
+                f"lambda*l_guide={mean_lambda_guide:.4f} "
+                f"conf_mask_mean={mean_conf:.4f}"
             )
 
     # 保存模型
@@ -618,6 +778,16 @@ def main():
             )
 
     print(f"Device: {device}")
+
+    # 打印模型参数量
+    model = LightweightVDLNet_PlacementAblation(
+        num_classes=NUM_CLASSES,
+        apply_asa=USE_ASA,
+        asa_before_pool=True,
+    ).to(device)
+    params = count_parameters(model)
+    print(f"Model Parameters: {params / 1e6:.2f} M")
+
     print(
         f"Config: INNER_EPOCHS={INNER_EPOCHS}, LAMBDA_GUIDANCE={LAMBDA_GUIDANCE}, "
         f"USE_WEIGHTED_SAMPLER={USE_WEIGHTED_SAMPLER}, "
@@ -638,7 +808,7 @@ def main():
         outer_train_wells = [w for w in all_wells if w != outer_test_well]
         print(f"Outer train wells: {outer_train_wells}")
 
-        best_epoch, inner_curve = inner_loo_select_best_epoch(
+        best_epoch, inner_curve, inner_histories = inner_loo_select_best_epoch(
             outer_train_wells=outer_train_wells,
             transform=transform,
             fixed_epochs=INNER_EPOCHS,
@@ -662,6 +832,17 @@ def main():
         print("Outer test confusion matrix:")
         print(final_result["confusion_matrix"])
 
+        # 统计训练时间和显存使用（使用 inner_histories 而不是 inner_curve）
+        all_times = []
+        all_mems = []
+
+        for hist in inner_histories:
+            all_times.extend(hist["time_per_epoch_sec"])
+            all_mems.extend(hist["gpu_mem_gb"])
+
+        avg_epoch_time = np.mean(all_times)
+        avg_gpu_mem = np.max(all_mems)
+
         outer_results.append(
             {
                 "outer_test_well": outer_test_well,
@@ -669,6 +850,8 @@ def main():
                 "best_epoch": best_epoch,
                 "test_acc": final_result["test_acc"],
                 "test_loss": final_result["test_loss"],
+                "train_time_epoch_sec": avg_epoch_time,
+                "gpu_memory_gb": avg_gpu_mem,
             }
         )
 
