@@ -307,16 +307,14 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
                 a1_logits, a1 = self.att1(x)
                 x = x + x * a1.expand_as(x)
             else:
-                a1 = self.att1(x)
-                x = a1
+                x = self.att1(x)
         x = self.block1_pool(x)
         if enable_attention and (not self.asa_before_pool):
             if self.attention == "ASA":
                 a1_logits, a1 = self.att1(x)
                 x = x + x * a1.expand_as(x)
             else:
-                a1 = self.att1(x)
-                x = a1
+                x = self.att1(x)
 
         x = self.block2_conv(x)
 
@@ -349,16 +347,14 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
                 a3_logits, a3 = self.att3(x)
                 x = x + x * a3.expand_as(x)
             else:
-                a3 = self.att3(x)
-                x = a3
+                x = self.att3(x)
         x = self.block3_pool(x)
         if enable_attention and (not self.asa_before_pool):
             if self.attention == "ASA":
                 a3_logits, a3 = self.att3(x)
                 x = x + x * a3.expand_as(x)
             else:
-                a3 = self.att3(x)
-                x = a3
+                x = self.att3(x)
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
