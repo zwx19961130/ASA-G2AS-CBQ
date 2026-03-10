@@ -162,8 +162,9 @@ class AnisotropicSpatialAttention(nn.Module):
         avg_out = torch.mean(fused_attn, dim=1, keepdim=True)
         max_out, _ = torch.max(fused_attn, dim=1, keepdim=True)
         attention_map = torch.cat([avg_out, max_out], dim=1)
-        attention_map = self.fusion_conv(attention_map)
-        return self.sigmoid(attention_map)
+        attention_logits = self.fusion_conv(attention_map)
+        attention_map = torch.sigmoid(attention_logits)
+        return attention_logits, attention_map
 
 
 class SEBlock(nn.Module):
@@ -298,20 +299,23 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
 
         feat2 = None
         attn2 = None
+        attn2_logits = None
 
         x = self.block1_conv(x)
         if enable_attention and self.asa_before_pool:
-            a1 = self.att1(x)
             if self.attention == "ASA":
+                a1_logits, a1 = self.att1(x)
                 x = x + x * a1.expand_as(x)
             else:
+                a1 = self.att1(x)
                 x = a1
         x = self.block1_pool(x)
         if enable_attention and (not self.asa_before_pool):
-            a1 = self.att1(x)
             if self.attention == "ASA":
+                a1_logits, a1 = self.att1(x)
                 x = x + x * a1.expand_as(x)
             else:
+                a1 = self.att1(x)
                 x = a1
 
         x = self.block2_conv(x)
@@ -320,36 +324,40 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         if self.asa_before_pool:
             feat2 = x
             if enable_attention:
-                a2 = self.att2(x)
                 if self.attention == "ASA":
+                    a2_logits, a2 = self.att2(x)
+                    attn2_logits = a2_logits
                     attn2 = a2
                     x = x + x * a2.expand_as(x)
                 else:
-                    x = a2
+                    x = self.att2(x)
         x = self.block2_pool(x)
         if not self.asa_before_pool:
             feat2 = x
             if enable_attention:
-                a2 = self.att2(x)
                 if self.attention == "ASA":
+                    a2_logits, a2 = self.att2(x)
+                    attn2_logits = a2_logits
                     attn2 = a2
                     x = x + x * a2.expand_as(x)
                 else:
-                    x = a2
+                    x = self.att2(x)
 
         x = self.block3_conv(x)
         if enable_attention and self.asa_before_pool:
-            a3 = self.att3(x)
             if self.attention == "ASA":
+                a3_logits, a3 = self.att3(x)
                 x = x + x * a3.expand_as(x)
             else:
+                a3 = self.att3(x)
                 x = a3
         x = self.block3_pool(x)
         if enable_attention and (not self.asa_before_pool):
-            a3 = self.att3(x)
             if self.attention == "ASA":
+                a3_logits, a3 = self.att3(x)
                 x = x + x * a3.expand_as(x)
             else:
+                a3 = self.att3(x)
                 x = a3
 
         x = self.avgpool(x)
@@ -357,7 +365,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         logits = self.classifier(x)
 
         if return_guidance:
-            return logits, feat2, attn2
+            return logits, feat2, attn2_logits
         return logits
 
 
@@ -495,7 +503,7 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
     labels = labels.to(device)
 
     # === student 分支：根据 ATTENTION 决定是否开启 attention ===
-    outputs, feat2_s, attn2_s = student_model(
+    outputs, feat2_s, attn2_logits_s = student_model(
         inputs,
         enable_attention=(ATTENTION is not None),
         return_guidance=True
@@ -508,8 +516,8 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
     conf_mask = torch.tensor(0.0, device=device)
 
     if lambda_guidance > 0 and ATTENTION == "ASA": 
-        if attn2_s is None:
-            raise RuntimeError("attn2_s is None. ATTENTION==\"ASA\" 时应当产生 ASA2 注意力。")
+        if attn2_logits_s is None:
+            raise RuntimeError("attn2_logits_s is None. ATTENTION==\"ASA\" 时应当产生 ASA2 注意力。")
 
         # 使用 EMA teacher（关闭 attention）生成 Grad-CAM 目标
         # 关键修复：创建 requires_grad=True 的输入副本，确保 feat2_t 能够正确进入可求导图
@@ -549,15 +557,15 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
         guidance_map_G = guidance_map_G.clamp(max=5.0)
 
         # 尺寸安全检查
-        assert guidance_map_G.shape == attn2_s.shape, \
-            f"Shape mismatch: guidance_map_G {guidance_map_G.shape} vs attn2_s {attn2_s.shape}"
+        assert guidance_map_G.shape == attn2_logits_s.shape, \
+            f"Shape mismatch: guidance_map_G {guidance_map_G.shape} vs attn2_logits_s {attn2_logits_s.shape}"
 
         # ===== 改进 2: 使用 KL divergence 匹配空间分布而不是 MSE 匹配绝对值 =====
-        # 将 attention 和 guidance map 转为概率分布，然后计算 KL divergence
-        b = attn2_s.shape[0]
+        # 将 attention logits 和 guidance map 转为概率分布，然后计算 KL divergence
+        b = attn2_logits_s.shape[0]
 
         # flatten spatial dimensions
-        attn_flat = attn2_s.view(b, -1)
+        attn_flat = attn2_logits_s.view(b, -1)
         g_flat = guidance_map_G.view(b, -1)
 
         # 转成概率分布 (softmax over spatial dimensions)
