@@ -33,7 +33,9 @@ LEARNING_RATE = 2e-5
 IMAGE_SIZE = (500, 40)
 INNER_EPOCHS = 50
 LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.1))  # 建议范围: 0.001~0.1
-USE_ASA = True
+ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "CBAM", "None"
+if ATTENTION == "None":
+    ATTENTION = None
 USE_WEIGHTED_SAMPLER = True
 EMA_DECAY = 0.99  # EMA teacher 衰减率
 WARMUP_EPOCHS = 2  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训练分类
@@ -163,10 +165,78 @@ class AnisotropicSpatialAttention(nn.Module):
         return self.sigmoid(attention_map)
 
 
-class LightweightVDLNet_PlacementAblation(nn.Module):
-    def __init__(self, num_classes=3, apply_asa=True, asa_before_pool=True):
+class SEBlock(nn.Module):
+    def __init__(self, channels, r=16):
         super().__init__()
-        self.apply_asa = apply_asa
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // r),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // r, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class ECABlock(nn.Module):
+    def __init__(self, channels, k_size=3):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))
+        y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)
+        return x * y.expand_as(x)
+
+
+class CBAM(nn.Module):
+    def __init__(self, channels, r=16):
+        super().__init__()
+        self.channel_mlp = nn.Sequential(
+            nn.Linear(channels, channels // r),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // r, channels)
+        )
+        self.spatial = nn.Conv2d(2, 1, kernel_size=7, padding=3)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        avg = torch.mean(x, dim=(2, 3))
+        mx = torch.amax(x, dim=(2, 3))
+        ca = torch.sigmoid(self.channel_mlp(avg) + self.channel_mlp(mx)).view(b, c, 1, 1)
+        x = x * ca
+
+        avg = torch.mean(x, dim=1, keepdim=True)
+        mx, _ = torch.max(x, dim=1, keepdim=True)
+        sa = torch.sigmoid(self.spatial(torch.cat([avg, mx], dim=1)))
+        return x * sa
+
+
+def build_attention(att_type, channels):
+    if att_type == "ASA":
+        return AnisotropicSpatialAttention(channels)
+    if att_type == "SE":
+        return SEBlock(channels)
+    if att_type == "ECA":
+        return ECABlock(channels)
+    if att_type == "CBAM":
+        return CBAM(channels)
+    return nn.Identity()
+
+
+class LightweightVDLNet_PlacementAblation(nn.Module):
+    def __init__(self, num_classes=3, attention="ASA", asa_before_pool=True):
+        super().__init__()
+        self.attention = attention
         self.asa_before_pool = asa_before_pool
 
         self.block1_conv = nn.Sequential(
@@ -199,14 +269,11 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         )
         self.block3_pool = nn.MaxPool2d(2)
 
-        if self.apply_asa:
-            self.asa1 = AnisotropicSpatialAttention(32)
-            self.asa2 = AnisotropicSpatialAttention(64)
-            self.asa3 = AnisotropicSpatialAttention(128)
+        self.att1 = build_attention(self.attention, 32)
+        self.att2 = build_attention(self.attention, 64)
+        self.att3 = build_attention(self.attention, 128)
 
-        # Exposed for guidance loss (set each forward pass).
-        self.latest_guidance_features = None
-        self.latest_guidance_attention = None
+
 
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Sequential(
@@ -216,54 +283,73 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
             nn.Linear(64, num_classes),
         )
 
-    def forward(self, x, enable_asa=None, return_guidance=False):
+    def forward(self, x, enable_attention=None, return_guidance=False):
         """
-        enable_asa:
-            True/False 强制开关 ASA；None 表示使用 self.apply_asa
+        enable_attention:
+            True/False 强制开关 attention；None 表示根据 self.attention
         return_guidance:
             True 时返回 (logits, feat2, attn2)；否则只返回 logits
         """
-        if enable_asa is None:
-            enable_asa = self.apply_asa
+        if enable_attention is None:
+            enable_attention = self.attention is not None
 
-        # 只有当 apply_asa=True 时才真正启用 ASA
-        enable_asa = enable_asa and self.apply_asa
+        enable_attention = enable_attention and (self.attention is not None)
 
         feat2 = None
         attn2 = None
 
         x = self.block1_conv(x)
-        if enable_asa and self.asa_before_pool:
-            a1 = self.asa1(x)
-            x = x + x * a1.expand_as(x)
+        if enable_attention and self.asa_before_pool:
+            a1 = self.att1(x)
+            if self.attention == "ASA":
+                x = x + x * a1.expand_as(x)
+            else:
+                x = a1
         x = self.block1_pool(x)
-        if enable_asa and (not self.asa_before_pool):
-            a1 = self.asa1(x)
-            x = x + x * a1.expand_as(x)
+        if enable_attention and (not self.asa_before_pool):
+            a1 = self.att1(x)
+            if self.attention == "ASA":
+                x = x + x * a1.expand_as(x)
+            else:
+                x = a1
 
         x = self.block2_conv(x)
 
-        # --- 关键：无论 enable_asa 是否开启，都在"ASA2应当作用的位置"取 feat2 ---
+        # --- 关键：无论 enable_attention 是否开启，都在"attention2应当作用的位置"取 feat2 ---
         if self.asa_before_pool:
             feat2 = x
-            if enable_asa:
-                attn2 = self.asa2(x)
-                x = x + x * attn2.expand_as(x)
+            if enable_attention:
+                a2 = self.att2(x)
+                if self.attention == "ASA":
+                    attn2 = a2
+                    x = x + x * a2.expand_as(x)
+                else:
+                    x = a2
         x = self.block2_pool(x)
         if not self.asa_before_pool:
             feat2 = x
-            if enable_asa:
-                attn2 = self.asa2(x)
-                x = x + x * attn2.expand_as(x)
+            if enable_attention:
+                a2 = self.att2(x)
+                if self.attention == "ASA":
+                    attn2 = a2
+                    x = x + x * a2.expand_as(x)
+                else:
+                    x = a2
 
         x = self.block3_conv(x)
-        if enable_asa and self.asa_before_pool:
-            a3 = self.asa3(x)
-            x = x + x * a3.expand_as(x)
+        if enable_attention and self.asa_before_pool:
+            a3 = self.att3(x)
+            if self.attention == "ASA":
+                x = x + x * a3.expand_as(x)
+            else:
+                x = a3
         x = self.block3_pool(x)
-        if enable_asa and (not self.asa_before_pool):
-            a3 = self.asa3(x)
-            x = x + x * a3.expand_as(x)
+        if enable_attention and (not self.asa_before_pool):
+            a3 = self.att3(x)
+            if self.attention == "ASA":
+                x = x + x * a3.expand_as(x)
+            else:
+                x = a3
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
@@ -407,30 +493,30 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
     inputs = inputs.to(device)
     labels = labels.to(device)
 
-    # === student 分支：根据 USE_ASA 决定是否开启 ASA ===
+    # === student 分支：根据 ATTENTION 决定是否开启 attention ===
     outputs, feat2_s, attn2_s = student_model(
         inputs,
-        enable_asa=USE_ASA,
+        enable_attention=(ATTENTION is not None),
         return_guidance=True
     )
     l_cls = criterion_cls(outputs, labels)
 
     # === teacher 分支：使用 EMA teacher 生成 Grad-CAM 指导图 G ===
-    # 只有当 LAMBDA_GUIDANCE > 0 且 USE_ASA=True 时才计算 guidance
+    # 只有当 LAMBDA_GUIDANCE > 0 且 ATTENTION == "ASA" 时才计算 guidance
     l_guide = torch.tensor(0.0, device=device)
     conf_mask = torch.tensor(0.0, device=device)
 
-    if lambda_guidance > 0 and USE_ASA:
+    if lambda_guidance > 0 and ATTENTION == "ASA": 
         if attn2_s is None:
-            raise RuntimeError("attn2_s is None. USE_ASA=True 时应当产生 ASA2 注意力。")
+            raise RuntimeError("attn2_s is None. ATTENTION==\"ASA\" 时应当产生 ASA2 注意力。")
 
-        # 使用 EMA teacher（关闭 ASA）生成 Grad-CAM 目标
+        # 使用 EMA teacher（关闭 attention）生成 Grad-CAM 目标
         # 关键修复：创建 requires_grad=True 的输入副本，确保 feat2_t 能够正确进入可求导图
         inputs_t = inputs.detach().requires_grad_(True)
         teacher_model.eval()
         logits_t, feat2_t, _ = teacher_model(
             inputs_t,
-            enable_asa=False,
+            enable_attention=False,
             return_guidance=True
         )
 
@@ -504,7 +590,7 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
 def train_with_guidance(train_loader, val_loader, fixed_epochs):
     model = LightweightVDLNet_PlacementAblation(
         num_classes=NUM_CLASSES,
-        apply_asa=USE_ASA,
+        attention=ATTENTION,
         asa_before_pool=True,
     ).to(device)
 
@@ -662,7 +748,7 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
     # final training: no validation split, train exactly best_epoch rounds
     model = LightweightVDLNet_PlacementAblation(
         num_classes=NUM_CLASSES,
-        apply_asa=USE_ASA,
+        attention=ATTENTION,
         asa_before_pool=True,
     ).to(device)
 
@@ -730,7 +816,8 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
             # )
 
     # 保存模型
-    model_path = f"guided_model_outer_{outer_test_well}_ASA{USE_ASA}_lambda{LAMBDA_GUIDANCE}.pt"
+    att_name = ATTENTION if ATTENTION is not None else "None"
+    model_path = f"guided_model_outer_{outer_test_well}_att{att_name}_lambda{LAMBDA_GUIDANCE}.pt"
     torch.save(model.state_dict(), model_path)
     print(f"Saved model: {model_path}")
 
@@ -758,6 +845,7 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
 
 
 def main():
+    print(f"Running attention = {ATTENTION}")
     transform = get_transform()
     all_wells = get_all_wells(DATA_DIR)
 
@@ -782,16 +870,18 @@ def main():
     # 打印模型参数量
     model = LightweightVDLNet_PlacementAblation(
         num_classes=NUM_CLASSES,
-        apply_asa=USE_ASA,
+        attention=ATTENTION,
         asa_before_pool=True,
     ).to(device)
     params = count_parameters(model)
     print(f"Model Parameters: {params / 1e6:.2f} M")
 
     print(
-        f"Config: INNER_EPOCHS={INNER_EPOCHS}, LAMBDA_GUIDANCE={LAMBDA_GUIDANCE}, "
+        f"Config: ATTENTION={ATTENTION}, INNER_EPOCHS={INNER_EPOCHS}, "
+        f"LAMBDA_GUIDANCE={LAMBDA_GUIDANCE}, "
         f"USE_WEIGHTED_SAMPLER={USE_WEIGHTED_SAMPLER}, "
-        f"USE_CLASS_WEIGHT_IN_LOSS={USE_CLASS_WEIGHT_IN_LOSS}, USE_FOCAL_LOSS={USE_FOCAL_LOSS}"
+        f"USE_CLASS_WEIGHT_IN_LOSS={USE_CLASS_WEIGHT_IN_LOSS}, "
+        f"USE_FOCAL_LOSS={USE_FOCAL_LOSS}"
     )
 
     if USE_WEIGHTED_SAMPLER and USE_CLASS_WEIGHT_IN_LOSS:
@@ -815,7 +905,8 @@ def main():
         )
         print(f"Selected best epoch for outer test={outer_test_well}: {best_epoch}")
 
-        inner_curve_path = f"inner_curve_outer_test_{outer_test_well}.csv"
+        att_name = ATTENTION if ATTENTION is not None else "None"
+        inner_curve_path = f"inner_curve_outer_test_{outer_test_well}_att{att_name}.csv"
         inner_curve.to_csv(inner_curve_path, index=False)
         print(f"Saved inner-LOO epoch curve: {inner_curve_path}")
 
@@ -858,13 +949,14 @@ def main():
         print(f"[PERF] {outer_test_well} | time/epoch={avg_epoch_time:.2f}s | gpu_mem={avg_gpu_mem:.2f}GB")
 
     results_df = pd.DataFrame(outer_results)
-    results_df.to_csv("outer_loo_results.csv", index=False)
+    att_name = ATTENTION if ATTENTION is not None else "None"
+    results_df.to_csv(f"outer_loo_results_att{att_name}.csv", index=False)
 
     print("\n" + "=" * 90)
     print("Two-level LOO complete.")
     print(results_df)
     print(f"Mean outer test acc: {results_df['test_acc'].mean():.2f}%")
-    print("Saved summary to outer_loo_results.csv")
+    print(f"Saved summary to outer_loo_results_att{att_name}.csv")
 
 
 if __name__ == "__main__":
