@@ -36,7 +36,7 @@ LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.1))  # 建议范围: 0.001~0.
 USE_ASA = True
 USE_WEIGHTED_SAMPLER = True
 EMA_DECAY = 0.99  # EMA teacher 衰减率
-WARMUP_EPOCHS = 3  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训练分类
+WARMUP_EPOCHS = 2  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训练分类
 USE_CLASS_WEIGHT_IN_LOSS = False
 USE_FOCAL_LOSS = False
 FOCAL_GAMMA = 2.0
@@ -575,13 +575,13 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
             mean_lambda_guide = effective_lambda * mean_guide
             mean_conf = sum_conf / num_batches
 
-            print(
-                f"[GGAS stats] "
-                f"mean_l_cls={mean_cls:.4f} "
-                f"mean_l_guide={mean_guide:.4f} "
-                f"lambda*l_guide={mean_lambda_guide:.4f} "
-                f"conf_mask_mean={mean_conf:.4f}"
-            )
+            # print(
+            #     f"[GGAS stats] "
+            #     f"mean_l_cls={mean_cls:.4f} "
+            #     f"mean_l_guide={mean_guide:.4f} "
+            #     f"lambda*l_guide={mean_lambda_guide:.4f} "
+            #     f"conf_mask_mean={mean_conf:.4f}"
+            # )
 
         # 计算训练时间和显存使用
         epoch_time = time.time() - start_time
@@ -721,13 +721,13 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
             mean_lambda_guide = effective_lambda * mean_guide
             mean_conf = sum_conf / num_batches
 
-            print(
-                f"[GGAS stats] "
-                f"mean_l_cls={mean_cls:.4f} "
-                f"mean_l_guide={mean_guide:.4f} "
-                f"lambda*l_guide={mean_lambda_guide:.4f} "
-                f"conf_mask_mean={mean_conf:.4f}"
-            )
+            # print(
+            #     f"[GGAS stats] "
+            #     f"mean_l_cls={mean_cls:.4f} "
+            #     f"mean_l_guide={mean_guide:.4f} "
+            #     f"lambda*l_guide={mean_lambda_guide:.4f} "
+            #     f"conf_mask_mean={mean_conf:.4f}"
+            # )
 
     # 保存模型
     model_path = f"guided_model_outer_{outer_test_well}_ASA{USE_ASA}_lambda{LAMBDA_GUIDANCE}.pt"
@@ -854,6 +854,8 @@ def main():
                 "gpu_memory_gb": avg_gpu_mem,
             }
         )
+        
+        print(f"[PERF] {outer_test_well} | time/epoch={avg_epoch_time:.2f}s | gpu_mem={avg_gpu_mem:.2f}GB")
 
     results_df = pd.DataFrame(outer_results)
     results_df.to_csv("outer_loo_results.csv", index=False)
