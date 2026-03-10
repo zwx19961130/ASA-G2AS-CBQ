@@ -675,7 +675,8 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
 
         # 计算训练时间和显存使用
         epoch_time = time.time() - start_time
-        peak_mem = torch.cuda.max_memory_allocated() / 1024**3
+        # peak memory in megabytes
+        peak_mem_mb = torch.cuda.max_memory_allocated() / 1024**2
 
         val_result = evaluate(model, val_loader, criterion_cls)
         epoch_metrics.append(
@@ -684,7 +685,7 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
                 "val_loss": val_result["loss"],
                 "val_acc": val_result["acc"],
                 "time_per_epoch_sec": epoch_time,
-                "gpu_mem_gb": peak_mem
+                "gpu_mem_mb": peak_mem_mb
             }
         )
 
@@ -932,7 +933,7 @@ def main():
 
         for hist in inner_histories:
             all_times.extend(hist["time_per_epoch_sec"])
-            all_mems.extend(hist["gpu_mem_gb"])
+            all_mems.extend(hist["gpu_mem_mb"])
 
         avg_epoch_time = np.mean(all_times)
         avg_gpu_mem = np.max(all_mems)
@@ -945,11 +946,11 @@ def main():
                 "test_acc": final_result["test_acc"],
                 "test_loss": final_result["test_loss"],
                 "train_time_epoch_sec": avg_epoch_time,
-                "gpu_memory_gb": avg_gpu_mem,
+                "gpu_memory_mb": avg_gpu_mem,
             }
         )
         
-        print(f"[PERF] {outer_test_well} | time/epoch={avg_epoch_time:.2f}s | gpu_mem={avg_gpu_mem:.2f}GB")
+        print(f"[PERF] {outer_test_well} | time/epoch={avg_epoch_time:.2f}s | gpu_mem={avg_gpu_mem:.2f}MB")
 
     results_df = pd.DataFrame(outer_results)
     # placement_tag already computed above
