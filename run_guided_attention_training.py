@@ -35,13 +35,18 @@ IMAGE_SIZE = (VERTICAL_RESOLUTION, 40)
 INNER_EPOCHS = 50
 LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.1))  # 建议范围: 0.001~0.1
 ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "CBAM", "None"
-if ATTENTION == "None":
-    ATTENTION = None
 
 # switches for individual attention placements (layer1, layer2, layer3)
-ATT_L1 = bool(int(os.environ.get("ATT_L1", "0")))
-ATT_L2 = bool(int(os.environ.get("ATT_L2", "0")))
+ATT_L1 = bool(int(os.environ.get("ATT_L1", "1")))
+ATT_L2 = bool(int(os.environ.get("ATT_L2", "1")))
 ATT_L3 = bool(int(os.environ.get("ATT_L3", "1")))  # set to 0/1 if you prefer environment control
+
+# special treatment: treat None as ASA with all layer switches off
+if ATTENTION == "None":
+    ATTENTION = "ASA"
+    ATT_L1 = False
+    ATT_L2 = False
+    ATT_L3 = False
 USE_WEIGHTED_SAMPLER = True
 EMA_DECAY = 0.99  # EMA teacher 衰减率
 WARMUP_EPOCHS = 2  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训练分类
