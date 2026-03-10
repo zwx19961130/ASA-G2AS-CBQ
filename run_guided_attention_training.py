@@ -37,6 +37,11 @@ LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.1))  # 建议范围: 0.001~0.
 ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "CBAM", "None"
 if ATTENTION == "None":
     ATTENTION = None
+
+# switches for individual attention placements (layer1, layer2, layer3)
+ATT_L1 = bool(int(os.environ.get("ATT_L1", "0")))
+ATT_L2 = bool(int(os.environ.get("ATT_L2", "0")))
+ATT_L3 = bool(int(os.environ.get("ATT_L3", "1")))  # set to 0/1 if you prefer environment control
 USE_WEIGHTED_SAMPLER = True
 EMA_DECAY = 0.99  # EMA teacher 衰减率
 WARMUP_EPOCHS = 2  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训练分类
@@ -302,14 +307,15 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         attn2_logits = None
 
         x = self.block1_conv(x)
-        if enable_attention and self.asa_before_pool:
+        # layer‑1 attention controlled by ATT_L1
+        if enable_attention and ATT_L1 and self.asa_before_pool:
             if self.attention == "ASA":
                 a1_logits, a1 = self.att1(x)
                 x = x + x * a1.expand_as(x)
             else:
                 x = self.att1(x)
         x = self.block1_pool(x)
-        if enable_attention and (not self.asa_before_pool):
+        if enable_attention and ATT_L1 and (not self.asa_before_pool):
             if self.attention == "ASA":
                 a1_logits, a1 = self.att1(x)
                 x = x + x * a1.expand_as(x)
@@ -321,7 +327,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         # --- 关键：无论 enable_attention 是否开启，都在"attention2应当作用的位置"取 feat2 ---
         if self.asa_before_pool:
             feat2 = x
-            if enable_attention:
+            if enable_attention and ATT_L2:
                 if self.attention == "ASA":
                     a2_logits, a2 = self.att2(x)
                     attn2_logits = a2_logits
@@ -332,7 +338,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         x = self.block2_pool(x)
         if not self.asa_before_pool:
             feat2 = x
-            if enable_attention:
+            if enable_attention and ATT_L2:
                 if self.attention == "ASA":
                     a2_logits, a2 = self.att2(x)
                     attn2_logits = a2_logits
@@ -342,14 +348,14 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
                     x = self.att2(x)
 
         x = self.block3_conv(x)
-        if enable_attention and self.asa_before_pool:
+        if enable_attention and ATT_L3 and self.asa_before_pool:
             if self.attention == "ASA":
                 a3_logits, a3 = self.att3(x)
                 x = x + x * a3.expand_as(x)
             else:
                 x = self.att3(x)
         x = self.block3_pool(x)
-        if enable_attention and (not self.asa_before_pool):
+        if enable_attention and ATT_L3 and (not self.asa_before_pool):
             if self.attention == "ASA":
                 a3_logits, a3 = self.att3(x)
                 x = x + x * a3.expand_as(x)
@@ -808,7 +814,8 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
 
     # 保存模型
     att_name = ATTENTION if ATTENTION is not None else "None"
-    model_path = f"guided_model_outer_{outer_test_well}_att{att_name}_lambda{LAMBDA_GUIDANCE}.pt"
+    placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
+    model_path = f"guided_model_outer_{outer_test_well}_{placement_tag}_lambda{LAMBDA_GUIDANCE}.pt"
     torch.save(model.state_dict(), model_path)
     print(f"Saved model: {model_path}")
 
@@ -872,7 +879,8 @@ def main():
         f"LAMBDA_GUIDANCE={LAMBDA_GUIDANCE}, "
         f"USE_WEIGHTED_SAMPLER={USE_WEIGHTED_SAMPLER}, "
         f"USE_CLASS_WEIGHT_IN_LOSS={USE_CLASS_WEIGHT_IN_LOSS}, "
-        f"USE_FOCAL_LOSS={USE_FOCAL_LOSS}"
+        f"USE_FOCAL_LOSS={USE_FOCAL_LOSS}, "
+        f"ATT_L1={ATT_L1},ATT_L2={ATT_L2},ATT_L3={ATT_L3}"
     )
 
     if USE_WEIGHTED_SAMPLER and USE_CLASS_WEIGHT_IN_LOSS:
@@ -882,6 +890,10 @@ def main():
         )
 
     outer_results = []
+
+    # placement tag used in filenames
+    att_name = ATTENTION if ATTENTION is not None else "None"
+    placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
 
     for outer_test_well in all_wells:
         print("\n" + "=" * 90)
@@ -897,7 +909,7 @@ def main():
         print(f"Selected best epoch for outer test={outer_test_well}: {best_epoch}")
 
         att_name = ATTENTION if ATTENTION is not None else "None"
-        inner_curve_path = f"inner_curve_outer_test_{outer_test_well}_att{att_name}.csv"
+        inner_curve_path = f"inner_curve_outer_test_{outer_test_well}_{placement_tag}.csv"
         inner_curve.to_csv(inner_curve_path, index=False)
         print(f"Saved inner-LOO epoch curve: {inner_curve_path}")
 
@@ -940,14 +952,14 @@ def main():
         print(f"[PERF] {outer_test_well} | time/epoch={avg_epoch_time:.2f}s | gpu_mem={avg_gpu_mem:.2f}GB")
 
     results_df = pd.DataFrame(outer_results)
-    att_name = ATTENTION if ATTENTION is not None else "None"
-    results_df.to_csv(f"outer_loo_results_att{att_name}.csv", index=False)
+    # placement_tag already computed above
+    results_df.to_csv(f"outer_loo_results_{placement_tag}.csv", index=False)
 
     print("\n" + "=" * 90)
     print("Two-level LOO complete.")
     print(results_df)
     print(f"Mean outer test acc: {results_df['test_acc'].mean():.2f}%")
-    print(f"Saved summary to outer_loo_results_att{att_name}.csv")
+    print(f"Saved summary to outer_loo_results_{placement_tag}.csv")
 
 
 if __name__ == "__main__":
