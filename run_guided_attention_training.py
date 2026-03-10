@@ -33,11 +33,11 @@ NUM_CLASSES = 3
 LEARNING_RATE = 2e-5
 IMAGE_SIZE = (VERTICAL_RESOLUTION, 40)
 INNER_EPOCHS = 50
-LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.1))  # 建议范围: 0.001~0.1
+LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.0))  # 建议范围: 0.001~0.1
 ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "CBAM", "None"
 
 # switches for individual attention placements (layer1, layer2, layer3)
-ATT_L1 = bool(int(os.environ.get("ATT_L1", "1")))
+ATT_L1 = bool(int(os.environ.get("ATT_L1", "0")))
 ATT_L2 = bool(int(os.environ.get("ATT_L2", "1")))
 ATT_L3 = bool(int(os.environ.get("ATT_L3", "1")))  # set to 0/1 if you prefer environment control
 
@@ -53,7 +53,8 @@ WARMUP_EPOCHS = 2  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训
 USE_CLASS_WEIGHT_IN_LOSS = False
 USE_FOCAL_LOSS = False
 FOCAL_GAMMA = 2.0
-NUM_WORKERS = 4
+# for reproducibility you can set NUM_WORKERS=0; otherwise workers are seeded
+NUM_WORKERS = 0  # use 0 when you want exact deterministic loader behaviour
 # Optional: set to a list of expected wells to enforce full-dataset coverage.
 EXPECTED_WELLS = None
 
@@ -399,6 +400,12 @@ def get_transform():
     return transforms.Compose([transforms.Resize(IMAGE_SIZE), transforms.ToTensor()])
 
 
+def seed_worker(worker_id):
+    worker_seed = SEED + worker_id
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
 def get_all_wells(root_dir):
     wells = sorted([w for w in os.listdir(root_dir) if is_valid_well_dir(root_dir, w)])
     return wells
@@ -410,16 +417,21 @@ def build_loader(dataset, is_train):
         classes, counts = np.unique(labels, return_counts=True)
         class_weights_for_sampler = {c: 1.0 / cnt for c, cnt in zip(classes, counts)}
         sample_weights = np.array([class_weights_for_sampler[l] for l in labels])
+        g = torch.Generator()
+        g.manual_seed(SEED)
         sampler = WeightedRandomSampler(
             torch.from_numpy(sample_weights).float(),
             num_samples=len(sample_weights),
             replacement=True,
+            generator=g,
         )
         return DataLoader(
             dataset,
             batch_size=BATCH_SIZE,
             sampler=sampler,
             num_workers=NUM_WORKERS,
+            worker_init_fn=seed_worker,
+            generator=torch.Generator().manual_seed(SEED),
             pin_memory=True,
         )
 
@@ -428,6 +440,8 @@ def build_loader(dataset, is_train):
         batch_size=BATCH_SIZE,
         shuffle=is_train,
         num_workers=NUM_WORKERS,
+        worker_init_fn=seed_worker,
+        generator=torch.Generator().manual_seed(SEED),
         pin_memory=True,
     )
 
