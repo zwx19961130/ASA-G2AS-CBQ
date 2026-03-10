@@ -25,12 +25,13 @@ from sklearn.utils.class_weight import compute_class_weight
 # Global Config
 # ==============================================================================
 
-SEED = 42
+SEED = int(os.environ.get("SEED", "42"))
+VERTICAL_RESOLUTION = int(os.environ.get("VERTICAL_RESOLUTION", "500"))
 DATA_DIR = "vdl_slices_20px"
 BATCH_SIZE = 32
 NUM_CLASSES = 3
 LEARNING_RATE = 2e-5
-IMAGE_SIZE = (500, 40)
+IMAGE_SIZE = (VERTICAL_RESOLUTION, 40)
 INNER_EPOCHS = 50
 LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.1))  # 建议范围: 0.001~0.1
 ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "CBAM", "None"
@@ -661,13 +662,6 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
             mean_lambda_guide = effective_lambda * mean_guide
             mean_conf = sum_conf / num_batches
 
-            # print(
-            #     f"[GGAS stats] "
-            #     f"mean_l_cls={mean_cls:.4f} "
-            #     f"mean_l_guide={mean_guide:.4f} "
-            #     f"lambda*l_guide={mean_lambda_guide:.4f} "
-            #     f"conf_mask_mean={mean_conf:.4f}"
-            # )
 
         # 计算训练时间和显存使用
         epoch_time = time.time() - start_time
@@ -807,13 +801,6 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
             mean_lambda_guide = effective_lambda * mean_guide
             mean_conf = sum_conf / num_batches
 
-            # print(
-            #     f"[GGAS stats] "
-            #     f"mean_l_cls={mean_cls:.4f} "
-            #     f"mean_l_guide={mean_guide:.4f} "
-            #     f"lambda*l_guide={mean_lambda_guide:.4f} "
-            #     f"conf_mask_mean={mean_conf:.4f}"
-            # )
 
     # 保存模型
     att_name = ATTENTION if ATTENTION is not None else "None"
