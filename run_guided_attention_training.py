@@ -327,6 +327,11 @@ class CBAM(nn.Module):
         return gate.expand_as(x)
 
 
+class GateIdentity(nn.Module):
+    def forward(self, x):
+        return torch.ones_like(x)
+
+
 def build_attention(att_type, channels):
     if att_type == "ASA":
         return AnisotropicSpatialAttention(
@@ -340,7 +345,7 @@ def build_attention(att_type, channels):
         return ECABlock(channels)
     if att_type == "CBAM":
         return CBAM(channels)
-    return nn.Identity()
+    return GateIdentity()
 
 
 class LightweightVDLNet_PlacementAblation(nn.Module):
