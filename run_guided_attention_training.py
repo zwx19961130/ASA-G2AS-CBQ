@@ -1033,7 +1033,7 @@ def main():
         attention=ATTENTION,
     ).to(device)
     params = count_parameters(model)
-    print(f"Model Parameters: {params / 1e6:.2f} M")
+    print(f"Model Parameters: {params / 1e3:.2f} K")
 
     print(
         f"Config: ATTENTION={ATTENTION}, INNER_EPOCHS={INNER_EPOCHS}, "
