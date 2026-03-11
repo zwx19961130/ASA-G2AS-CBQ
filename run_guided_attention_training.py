@@ -5,6 +5,21 @@ import os
 import copy
 import random
 
+# ===== Normalization control =====
+NORM_TYPE = os.environ.get("NORM_TYPE", "BN")  
+# options: BN | IN | NONE
+
+def Norm2d(ch):
+    if NORM_TYPE == "BN":
+        return nn.BatchNorm2d(ch)
+    elif NORM_TYPE == "IN":
+        return nn.InstanceNorm2d(ch, affine=True)
+    elif NORM_TYPE == "NONE":
+        return nn.Identity()
+    else:
+        raise ValueError(f"Unsupported NORM_TYPE '{NORM_TYPE}', must be BN, IN, or NONE")
+
+
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -35,6 +50,8 @@ IMAGE_SIZE = (VERTICAL_RESOLUTION, 40)
 INNER_EPOCHS = 50
 LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.0))  # 建议范围: 0.001~0.1
 ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "CBAM", "None"
+if ATTENTION == "None":
+    ATTENTION = None
 
 # switches for individual attention placements (layer1, layer2, layer3)
 ATT_L1 = bool(int(os.environ.get("ATT_L1", "0")))
@@ -267,10 +284,10 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
 
         self.block1_conv = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            Norm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            Norm2d(32),
             nn.ReLU(inplace=True),
         )
         self.block1_pool = nn.MaxPool2d(2)
@@ -807,6 +824,13 @@ def inner_loo_select_best_epoch(outer_train_wells, train_transform, eval_transfo
 
 
 def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transform, eval_transform, best_epoch):
+    # replicate tagging so names inside this function are valid
+    att_name = ATTENTION if ATTENTION is not None else "None"
+    placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
+    aug_tag = f"flip{int(USE_HFLIP)}_shift{int(USE_TIMESHIFT)}"
+    norm_tag = f"norm{NORM_TYPE}"
+    full_tag = f"{placement_tag}_{aug_tag}_{norm_tag}"
+
     train_ds = CementVDLDataset(DATA_DIR, transform=train_transform, selected_wells=outer_train_wells)
     test_ds = CementVDLDataset(DATA_DIR, transform=eval_transform, selected_wells=[outer_test_well])
 
@@ -954,6 +978,7 @@ def main():
         f"USE_HFLIP={USE_HFLIP}, "
         f"USE_TIMESHIFT={USE_TIMESHIFT}, "
         f"TIMESHIFT_MAX={TIMESHIFT_MAX}, "
+        f"NORM_TYPE={NORM_TYPE}, "
     )
 
     if USE_WEIGHTED_SAMPLER and USE_CLASS_WEIGHT_IN_LOSS:
@@ -968,7 +993,8 @@ def main():
     att_name = ATTENTION if ATTENTION is not None else "None"
     placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
     aug_tag = f"flip{int(USE_HFLIP)}_shift{int(USE_TIMESHIFT)}"
-    full_tag = f"{placement_tag}_{aug_tag}"
+    norm_tag = f"norm{NORM_TYPE}"
+    full_tag = f"{placement_tag}_{aug_tag}_{norm_tag}"
 
     for outer_test_well in all_wells:
         print("\n" + "=" * 90)
@@ -1036,7 +1062,7 @@ def main():
     print("Two-level LOO complete.")
     print(results_df)
     print(f"Mean outer test acc: {results_df['test_acc'].mean():.2f}%")
-    print(f"Saved summary to outer_loo_results_{placement_tag}.csv")
+    print(f"Saved summary to outer_loo_results_{full_tag}.csv")
 
 
 if __name__ == "__main__":
