@@ -285,8 +285,7 @@ class SEBlock(nn.Module):
         b, c, _, _ = x.shape
         y = self.pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1, 1)
-        # residual-style output
-        return x + x * y
+        return y.expand_as(x)
 
 
 class ECABlock(nn.Module):
@@ -300,8 +299,7 @@ class ECABlock(nn.Module):
         y = self.pool(x)
         y = self.conv(y.squeeze(-1).transpose(-1, -2))
         y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)
-        # residual style
-        return x + x * y.expand_as(x)
+        return y.expand_as(x)
 
 
 class CBAM(nn.Module):
@@ -320,14 +318,13 @@ class CBAM(nn.Module):
         avg = torch.mean(x, dim=(2, 3))
         mx = torch.amax(x, dim=(2, 3))
         ca = torch.sigmoid(self.channel_mlp(avg) + self.channel_mlp(mx)).view(b, c, 1, 1)
-        # apply channel attention residually
-        x = x + x * ca
+        x_ca = x * ca
 
-        avg = torch.mean(x, dim=1, keepdim=True)
-        mx, _ = torch.max(x, dim=1, keepdim=True)
+        avg = torch.mean(x_ca, dim=1, keepdim=True)
+        mx, _ = torch.max(x_ca, dim=1, keepdim=True)
         sa = torch.sigmoid(self.spatial(torch.cat([avg, mx], dim=1)))
-        # final residual combination
-        return x + x * sa
+        gate = ca * sa
+        return gate.expand_as(x)
 
 
 def build_attention(att_type, channels):
@@ -417,16 +414,18 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         if enable_attention and ATT_L1 and self.asa_before_pool:
             if self.attention == "ASA":
                 a1_logits, a1 = self.att1(x)
-                x = x + x * a1.expand_as(x)
+                x = x * a1.expand_as(x)
             else:
-                x = self.att1(x)
+                g1 = self.att1(x)
+                x = x * g1
         x = self.block1_pool(x)
         if enable_attention and ATT_L1 and (not self.asa_before_pool):
             if self.attention == "ASA":
                 a1_logits, a1 = self.att1(x)
-                x = x + x * a1.expand_as(x)
+                x = x * a1.expand_as(x)
             else:
-                x = self.att1(x)
+                g1 = self.att1(x)
+                x = x * g1
 
         x = self.block2_conv(x)
 
@@ -438,9 +437,10 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
                     a2_logits, a2 = self.att2(x)
                     attn2_logits = a2_logits
                     attn2 = a2
-                    x = x + x * a2.expand_as(x)
+                    x = x * a2.expand_as(x)
                 else:
-                    x = self.att2(x)
+                    g2 = self.att2(x)
+                    x = x * g2
         x = self.block2_pool(x)
         if not self.asa_before_pool:
             feat2 = x
@@ -449,24 +449,27 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
                     a2_logits, a2 = self.att2(x)
                     attn2_logits = a2_logits
                     attn2 = a2
-                    x = x + x * a2.expand_as(x)
+                    x = x * a2.expand_as(x)
                 else:
-                    x = self.att2(x)
+                    g2 = self.att2(x)
+                    x = x * g2
 
         x = self.block3_conv(x)
         if enable_attention and ATT_L3 and self.asa_before_pool:
             if self.attention == "ASA":
                 a3_logits, a3 = self.att3(x)
-                x = x + x * a3.expand_as(x)
+                x = x * a3.expand_as(x)
             else:
-                x = self.att3(x)
+                g3 = self.att3(x)
+                x = x * g3
         x = self.block3_pool(x)
         if enable_attention and ATT_L3 and (not self.asa_before_pool):
             if self.attention == "ASA":
                 a3_logits, a3 = self.att3(x)
-                x = x + x * a3.expand_as(x)
+                x = x * a3.expand_as(x)
             else:
-                x = self.att3(x)
+                g3 = self.att3(x)
+                x = x * g3
 
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
