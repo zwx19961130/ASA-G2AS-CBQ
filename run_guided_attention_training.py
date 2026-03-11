@@ -77,15 +77,24 @@ def is_valid_well_dir(root_dir, well_name):
 
 
 def set_seed(seed):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+
+    # make CUDA/cuDNN deterministic
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    os.environ["PYTHONHASHSEED"] = str(seed)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.use_deterministic_algorithms(True)
 
+
+# limit CPU parallelism for determinism
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 set_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -118,7 +127,7 @@ class CementVDLDataset(Dataset):
                 if not os.path.isdir(class_dir):
                     continue
 
-                for fname in os.listdir(class_dir):
+                for fname in sorted(os.listdir(class_dir)):
                     if fname.endswith(".png"):
                         self.samples.append((os.path.join(class_dir, fname), label_idx))
 
@@ -402,8 +411,9 @@ def get_transform():
 
 def seed_worker(worker_id):
     worker_seed = SEED + worker_id
-    np.random.seed(worker_seed)
     random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 def get_all_wells(root_dir):
@@ -412,13 +422,16 @@ def get_all_wells(root_dir):
 
 
 def build_loader(dataset, is_train):
+    # use a consistent generator for every loader call
+    g = torch.Generator()
+    g.manual_seed(SEED)
+
     if is_train and USE_WEIGHTED_SAMPLER:
         labels = np.array([dataset[i][1] for i in range(len(dataset))])
         classes, counts = np.unique(labels, return_counts=True)
         class_weights_for_sampler = {c: 1.0 / cnt for c, cnt in zip(classes, counts)}
         sample_weights = np.array([class_weights_for_sampler[l] for l in labels])
-        g = torch.Generator()
-        g.manual_seed(SEED)
+
         sampler = WeightedRandomSampler(
             torch.from_numpy(sample_weights).float(),
             num_samples=len(sample_weights),
@@ -431,7 +444,7 @@ def build_loader(dataset, is_train):
             sampler=sampler,
             num_workers=NUM_WORKERS,
             worker_init_fn=seed_worker,
-            generator=torch.Generator().manual_seed(SEED),
+            generator=g,
             pin_memory=True,
         )
 
@@ -441,7 +454,7 @@ def build_loader(dataset, is_train):
         shuffle=is_train,
         num_workers=NUM_WORKERS,
         worker_init_fn=seed_worker,
-        generator=torch.Generator().manual_seed(SEED),
+        generator=g,
         pin_memory=True,
     )
 
