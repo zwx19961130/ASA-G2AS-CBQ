@@ -53,6 +53,28 @@ ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "
 if ATTENTION == "None":
     ATTENTION = None
 
+# ===== ASA ablation switches =====
+ASA_PLACEMENT = os.environ.get("ASA_PLACEMENT", "before")  
+# options: before | after
+if ASA_PLACEMENT not in ("before", "after"):
+    raise ValueError(f"Invalid ASA_PLACEMENT '{ASA_PLACEMENT}'; must be 'before' or 'after'.")
+
+ASA_COMPONENT = os.environ.get("ASA_COMPONENT", "full")  
+# options: full | horizontal | vertical
+
+ASA_FUSION = os.environ.get("ASA_FUSION", "sum")  
+# options: sum | weighted | gate
+if ASA_FUSION not in ("sum", "weighted", "gate"):
+    raise ValueError(f"Invalid ASA_FUSION '{ASA_FUSION}'; must be 'sum', 'weighted' or 'gate'.")
+if ASA_COMPONENT not in ("full", "horizontal", "vertical"):
+    raise ValueError(f"Invalid ASA_COMPONENT '{ASA_COMPONENT}'; must be 'full', 'horizontal' or 'vertical'.")
+
+ASA_HPOOL = os.environ.get("ASA_HPOOL", "mean")  
+# "mean" = current design (mean over H)
+# "conv" = keep depth position (no mean pooling)
+if ASA_HPOOL not in ("mean", "conv"):
+    raise ValueError(f"Invalid ASA_HPOOL '{ASA_HPOOL}'; must be 'mean' or 'conv'.")
+
 # switches for individual attention placements (layer1, layer2, layer3)
 ATT_L1 = bool(int(os.environ.get("ATT_L1", "0")))
 ATT_L2 = bool(int(os.environ.get("ATT_L2", "1")))
@@ -165,16 +187,32 @@ class CementVDLDataset(Dataset):
 
 
 class AnisotropicSpatialAttention(nn.Module):
-    def __init__(self, in_planes):
+    def __init__(self, in_planes, component="full", hpool="mean"):
         super().__init__()
-        self.horizontal_conv = nn.Conv1d(
-            in_planes,
-            in_planes,
-            kernel_size=21,
-            padding=10,
-            groups=in_planes,
-            bias=False,
-        )
+        self.component = component
+        self.fusion_mode = ASA_FUSION
+        self.hpool = hpool
+
+        if self.hpool == "mean":
+            self.horizontal_conv = nn.Conv1d(
+                in_planes,
+                in_planes,
+                kernel_size=21,
+                padding=10,
+                groups=in_planes,
+                bias=False,
+            )
+            self.horizontal_conv2d = None
+        else:
+            self.horizontal_conv = None
+            self.horizontal_conv2d = nn.Conv2d(
+                in_planes,
+                in_planes,
+                kernel_size=(1, 21),
+                padding=(0, 10),
+                groups=in_planes,
+                bias=False,
+            )
         self.vertical_conv = nn.Conv1d(
             in_planes,
             in_planes,
@@ -184,18 +222,46 @@ class AnisotropicSpatialAttention(nn.Module):
             bias=False,
         )
         self.fusion_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+
+        # weighted fusion
+        if self.fusion_mode == "weighted":
+            # parameter unconstrained; will be squashed in forward
+            self.raw_alpha = nn.Parameter(torch.tensor(0.0))
+
+        # gating fusion
+        if self.fusion_mode == "gate":
+            self.gate = nn.Sequential(
+                nn.Conv2d(in_planes, 1, kernel_size=1),
+                nn.Sigmoid()
+            )
+
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        x_h_pooled = x.mean(dim=2)
-        h_attn = self.horizontal_conv(x_h_pooled)
-        h_attn = h_attn.unsqueeze(2).expand(-1, -1, x.shape[2], -1)
+        if self.hpool == "mean":
+            h_attn = x.mean(dim=2)
+            h_attn = self.horizontal_conv(h_attn)
+            h_attn = h_attn.unsqueeze(2).expand(-1, -1, x.shape[2], -1)
+        else:
+            h_attn = self.horizontal_conv2d(x)
 
         x_v_pooled = x.mean(dim=3)
         v_attn = self.vertical_conv(x_v_pooled)
         v_attn = v_attn.unsqueeze(3).expand(-1, -1, -1, x.shape[3])
 
-        fused_attn = h_attn + v_attn
+        if self.component == "horizontal":
+            fused_attn = h_attn
+        elif self.component == "vertical":
+            fused_attn = v_attn
+        else:
+            if self.fusion_mode == "sum":
+                fused_attn = h_attn + v_attn
+            elif self.fusion_mode == "weighted":
+                alpha = torch.sigmoid(self.raw_alpha)
+                fused_attn = alpha * h_attn + (1 - alpha) * v_attn
+            elif self.fusion_mode == "gate":
+                g = self.gate(x)
+                fused_attn = g * h_attn + (1 - g) * v_attn
         avg_out = torch.mean(fused_attn, dim=1, keepdim=True)
         max_out, _ = torch.max(fused_attn, dim=1, keepdim=True)
         attention_map = torch.cat([avg_out, max_out], dim=1)
@@ -266,7 +332,11 @@ class CBAM(nn.Module):
 
 def build_attention(att_type, channels):
     if att_type == "ASA":
-        return AnisotropicSpatialAttention(channels)
+        return AnisotropicSpatialAttention(
+            channels,
+            component=ASA_COMPONENT,
+            hpool=ASA_HPOOL,
+        )
     if att_type == "SE":
         return SEBlock(channels)
     if att_type == "ECA":
@@ -277,10 +347,10 @@ def build_attention(att_type, channels):
 
 
 class LightweightVDLNet_PlacementAblation(nn.Module):
-    def __init__(self, num_classes=3, attention="ASA", asa_before_pool=True):
+    def __init__(self, num_classes=3, attention="ASA"):
         super().__init__()
         self.attention = attention
-        self.asa_before_pool = asa_before_pool
+        self.asa_before_pool = (ASA_PLACEMENT == "before")
 
         self.block1_conv = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
@@ -294,20 +364,20 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
 
         self.block2_conv = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            Norm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            Norm2d(64),
             nn.ReLU(inplace=True),
         )
         self.block2_pool = nn.MaxPool2d(2)
 
         self.block3_conv = nn.Sequential(
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            Norm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            Norm2d(128),
             nn.ReLU(inplace=True),
         )
         self.block3_pool = nn.MaxPool2d(2)
@@ -687,7 +757,6 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
     model = LightweightVDLNet_PlacementAblation(
         num_classes=NUM_CLASSES,
         attention=ATTENTION,
-        asa_before_pool=True,
     ).to(device)
 
     # 创建 EMA teacher 模型
@@ -829,7 +898,7 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
     placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
     aug_tag = f"flip{int(USE_HFLIP)}_shift{int(USE_TIMESHIFT)}"
     norm_tag = f"norm{NORM_TYPE}"
-    full_tag = f"{placement_tag}_{aug_tag}_{norm_tag}"
+    full_tag = f"{placement_tag}_{aug_tag}_{norm_tag}_{ASA_PLACEMENT}_{ASA_COMPONENT}_{ASA_FUSION}_hpool{ASA_HPOOL}"
 
     train_ds = CementVDLDataset(DATA_DIR, transform=train_transform, selected_wells=outer_train_wells)
     test_ds = CementVDLDataset(DATA_DIR, transform=eval_transform, selected_wells=[outer_test_well])
@@ -846,7 +915,6 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
     model = LightweightVDLNet_PlacementAblation(
         num_classes=NUM_CLASSES,
         attention=ATTENTION,
-        asa_before_pool=True,
     ).to(device)
 
     # 创建 EMA teacher 模型
@@ -963,7 +1031,6 @@ def main():
     model = LightweightVDLNet_PlacementAblation(
         num_classes=NUM_CLASSES,
         attention=ATTENTION,
-        asa_before_pool=True,
     ).to(device)
     params = count_parameters(model)
     print(f"Model Parameters: {params / 1e6:.2f} M")
@@ -979,6 +1046,10 @@ def main():
         f"USE_TIMESHIFT={USE_TIMESHIFT}, "
         f"TIMESHIFT_MAX={TIMESHIFT_MAX}, "
         f"NORM_TYPE={NORM_TYPE}, "
+        f"ASA_PLACEMENT={ASA_PLACEMENT}, "
+        f"ASA_COMPONENT={ASA_COMPONENT}, "
+        f"ASA_FUSION={ASA_FUSION}, "
+        f"ASA_HPOOL={ASA_HPOOL}"
     )
 
     if USE_WEIGHTED_SAMPLER and USE_CLASS_WEIGHT_IN_LOSS:
@@ -994,7 +1065,7 @@ def main():
     placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
     aug_tag = f"flip{int(USE_HFLIP)}_shift{int(USE_TIMESHIFT)}"
     norm_tag = f"norm{NORM_TYPE}"
-    full_tag = f"{placement_tag}_{aug_tag}_{norm_tag}"
+    full_tag = f"{placement_tag}_{aug_tag}_{norm_tag}_{ASA_PLACEMENT}_{ASA_COMPONENT}_{ASA_FUSION}_hpool{ASA_HPOOL}"
 
     for outer_test_well in all_wells:
         print("\n" + "=" * 90)
