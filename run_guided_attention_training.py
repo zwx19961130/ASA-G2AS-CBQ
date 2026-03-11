@@ -26,7 +26,7 @@ from sklearn.utils.class_weight import compute_class_weight
 # ==============================================================================
 
 SEED = int(os.environ.get("SEED", "42"))
-VERTICAL_RESOLUTION = int(os.environ.get("VERTICAL_RESOLUTION", "500"))
+VERTICAL_RESOLUTION = int(os.environ.get("VERTICAL_RESOLUTION", "250"))
 DATA_DIR = "vdl_slices_20px"
 BATCH_SIZE = 32
 NUM_CLASSES = 3
@@ -40,6 +40,11 @@ ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "
 ATT_L1 = bool(int(os.environ.get("ATT_L1", "0")))
 ATT_L2 = bool(int(os.environ.get("ATT_L2", "1")))
 ATT_L3 = bool(int(os.environ.get("ATT_L3", "1")))  # set to 0/1 if you prefer environment control
+
+# data augmentation flags
+USE_HFLIP = bool(int(os.environ.get("USE_HFLIP", "0")))
+USE_TIMESHIFT = bool(int(os.environ.get("USE_TIMESHIFT", "0")))
+TIMESHIFT_MAX = int(os.environ.get("TIMESHIFT_MAX", "2"))  # 建议先用 2
 
 
 USE_WEIGHTED_SAMPLER = True
@@ -404,8 +409,40 @@ class FocalLoss(nn.Module):
 # ==============================================================================
 
 
-def get_transform():
-    return transforms.Compose([transforms.Resize(IMAGE_SIZE), transforms.ToTensor()])
+class TimeShift:
+    def __init__(self, max_shift=2, fill=0):
+        self.max_shift = max_shift
+        self.fill = fill
+
+    def __call__(self, img):
+        arr = np.array(img)
+        shift = random.randint(-self.max_shift, self.max_shift)
+
+        if shift == 0:
+            return Image.fromarray(arr)
+
+        out = np.full_like(arr, self.fill)
+
+        # width 方向平移：左右 shift
+        if shift > 0:
+            out[:, shift:] = arr[:, :-shift]
+        else:
+            out[:, :shift] = arr[:, -shift:]
+
+        return Image.fromarray(out)
+
+
+def get_transform(is_train=False):
+    tfms = [transforms.Resize(IMAGE_SIZE)]
+
+    if is_train:
+        if USE_HFLIP:
+            tfms.append(transforms.RandomHorizontalFlip(p=0.5))
+        if USE_TIMESHIFT:
+            tfms.append(TimeShift(max_shift=TIMESHIFT_MAX, fill=0))
+
+    tfms.append(transforms.ToTensor())
+    return transforms.Compose(tfms)
 
 
 def seed_worker(worker_id):
@@ -730,14 +767,14 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
     }
 
 
-def inner_loo_select_best_epoch(outer_train_wells, transform, fixed_epochs):
+def inner_loo_select_best_epoch(outer_train_wells, train_transform, eval_transform, fixed_epochs):
     inner_histories = []
 
     for inner_val_well in outer_train_wells:
         inner_train_wells = [w for w in outer_train_wells if w != inner_val_well]
 
-        train_ds = CementVDLDataset(DATA_DIR, transform=transform, selected_wells=inner_train_wells)
-        val_ds = CementVDLDataset(DATA_DIR, transform=transform, selected_wells=[inner_val_well])
+        train_ds = CementVDLDataset(DATA_DIR, transform=train_transform, selected_wells=inner_train_wells)
+        val_ds = CementVDLDataset(DATA_DIR, transform=eval_transform, selected_wells=[inner_val_well])
 
         if len(train_ds) == 0 or len(val_ds) == 0:
             raise RuntimeError(
@@ -769,9 +806,9 @@ def inner_loo_select_best_epoch(outer_train_wells, transform, fixed_epochs):
     return best_epoch, merged, inner_histories
 
 
-def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, best_epoch):
-    train_ds = CementVDLDataset(DATA_DIR, transform=transform, selected_wells=outer_train_wells)
-    test_ds = CementVDLDataset(DATA_DIR, transform=transform, selected_wells=[outer_test_well])
+def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transform, eval_transform, best_epoch):
+    train_ds = CementVDLDataset(DATA_DIR, transform=train_transform, selected_wells=outer_train_wells)
+    test_ds = CementVDLDataset(DATA_DIR, transform=eval_transform, selected_wells=[outer_test_well])
 
     if len(train_ds) == 0 or len(test_ds) == 0:
         raise RuntimeError(
@@ -847,7 +884,7 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
     # 保存模型
     att_name = ATTENTION if ATTENTION is not None else "None"
     placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
-    model_path = f"guided_model_outer_{outer_test_well}_{placement_tag}_lambda{LAMBDA_GUIDANCE}.pt"
+    model_path = f"guided_model_outer_{outer_test_well}_{full_tag}_lambda{LAMBDA_GUIDANCE}.pt"
     torch.save(model.state_dict(), model_path)
     print(f"Saved model: {model_path}")
 
@@ -876,7 +913,8 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, transform, bes
 
 def main():
     print(f"Running attention = {ATTENTION}")
-    transform = get_transform()
+    train_transform = get_transform(is_train=True)
+    eval_transform = get_transform(is_train=False)
     all_wells = get_all_wells(DATA_DIR)
 
     if len(all_wells) < 3:
@@ -912,7 +950,10 @@ def main():
         f"USE_WEIGHTED_SAMPLER={USE_WEIGHTED_SAMPLER}, "
         f"USE_CLASS_WEIGHT_IN_LOSS={USE_CLASS_WEIGHT_IN_LOSS}, "
         f"USE_FOCAL_LOSS={USE_FOCAL_LOSS}, "
-        f"ATT_L1={ATT_L1},ATT_L2={ATT_L2},ATT_L3={ATT_L3}"
+        f"ATT_L1={ATT_L1},ATT_L2={ATT_L2},ATT_L3={ATT_L3}, "
+        f"USE_HFLIP={USE_HFLIP}, "
+        f"USE_TIMESHIFT={USE_TIMESHIFT}, "
+        f"TIMESHIFT_MAX={TIMESHIFT_MAX}, "
     )
 
     if USE_WEIGHTED_SAMPLER and USE_CLASS_WEIGHT_IN_LOSS:
@@ -926,6 +967,8 @@ def main():
     # placement tag used in filenames
     att_name = ATTENTION if ATTENTION is not None else "None"
     placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
+    aug_tag = f"flip{int(USE_HFLIP)}_shift{int(USE_TIMESHIFT)}"
+    full_tag = f"{placement_tag}_{aug_tag}"
 
     for outer_test_well in all_wells:
         print("\n" + "=" * 90)
@@ -935,20 +978,22 @@ def main():
 
         best_epoch, inner_curve, inner_histories = inner_loo_select_best_epoch(
             outer_train_wells=outer_train_wells,
-            transform=transform,
+            train_transform=train_transform,
+            eval_transform=eval_transform,
             fixed_epochs=INNER_EPOCHS,
         )
         print(f"Selected best epoch for outer test={outer_test_well}: {best_epoch}")
 
         att_name = ATTENTION if ATTENTION is not None else "None"
-        inner_curve_path = f"inner_curve_outer_test_{outer_test_well}_{placement_tag}.csv"
+        inner_curve_path = f"inner_curve_outer_test_{outer_test_well}_{full_tag}.csv"
         inner_curve.to_csv(inner_curve_path, index=False)
         print(f"Saved inner-LOO epoch curve: {inner_curve_path}")
 
         final_result = train_full_outer_and_test(
             outer_train_wells=outer_train_wells,
             outer_test_well=outer_test_well,
-            transform=transform,
+            train_transform=train_transform,
+            eval_transform=eval_transform,
             best_epoch=best_epoch,
         )
 
@@ -985,7 +1030,7 @@ def main():
 
     results_df = pd.DataFrame(outer_results)
     # placement_tag already computed above
-    results_df.to_csv(f"outer_loo_results_{placement_tag}.csv", index=False)
+    results_df.to_csv(f"outer_loo_results_{full_tag}.csv", index=False)
 
     print("\n" + "=" * 90)
     print("Two-level LOO complete.")
