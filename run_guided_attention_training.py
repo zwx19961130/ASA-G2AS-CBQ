@@ -41,12 +41,7 @@ ATT_L1 = bool(int(os.environ.get("ATT_L1", "0")))
 ATT_L2 = bool(int(os.environ.get("ATT_L2", "1")))
 ATT_L3 = bool(int(os.environ.get("ATT_L3", "1")))  # set to 0/1 if you prefer environment control
 
-# special treatment: treat None as ASA with all layer switches off
-if ATTENTION == "None":
-    ATTENTION = "ASA"
-    ATT_L1 = False
-    ATT_L2 = False
-    ATT_L3 = False
+
 USE_WEIGHTED_SAMPLER = True
 EMA_DECAY = 0.99  # EMA teacher 衰减率
 WARMUP_EPOCHS = 2  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训练分类
@@ -202,7 +197,8 @@ class SEBlock(nn.Module):
         b, c, _, _ = x.shape
         y = self.pool(x).view(b, c)
         y = self.fc(y).view(b, c, 1, 1)
-        return x * y
+        # residual-style output
+        return x + x * y
 
 
 class ECABlock(nn.Module):
@@ -216,7 +212,8 @@ class ECABlock(nn.Module):
         y = self.pool(x)
         y = self.conv(y.squeeze(-1).transpose(-1, -2))
         y = self.sigmoid(y).transpose(-1, -2).unsqueeze(-1)
-        return x * y.expand_as(x)
+        # residual style
+        return x + x * y.expand_as(x)
 
 
 class CBAM(nn.Module):
@@ -235,12 +232,14 @@ class CBAM(nn.Module):
         avg = torch.mean(x, dim=(2, 3))
         mx = torch.amax(x, dim=(2, 3))
         ca = torch.sigmoid(self.channel_mlp(avg) + self.channel_mlp(mx)).view(b, c, 1, 1)
-        x = x * ca
+        # apply channel attention residually
+        x = x + x * ca
 
         avg = torch.mean(x, dim=1, keepdim=True)
         mx, _ = torch.max(x, dim=1, keepdim=True)
         sa = torch.sigmoid(self.spatial(torch.cat([avg, mx], dim=1)))
-        return x * sa
+        # final residual combination
+        return x + x * sa
 
 
 def build_attention(att_type, channels):
