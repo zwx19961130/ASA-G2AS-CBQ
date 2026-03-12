@@ -403,7 +403,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         enable_attention:
             True/False 强制开关 attention；None 表示根据 self.attention
         return_guidance:
-            True 时返回 (logits, feat2, attn2)；否则只返回 logits
+            True 时返回 (logits, feat2, attn2_logits, attn2_map)；否则只返回 logits
         """
         if enable_attention is None:
             enable_attention = self.attention is not None
@@ -413,6 +413,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         feat2 = None
         attn2 = None
         attn2_logits = None
+        attn2_map = None
 
         x = self.block1_conv(x)
         # layer‑1 attention controlled by ATT_L1
@@ -442,6 +443,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
                     a2_logits, a2 = self.att2(x)
                     attn2_logits = a2_logits
                     attn2 = a2
+                    attn2_map = a2
                     x = x * a2.expand_as(x)
                 else:
                     g2 = self.att2(x)
@@ -454,6 +456,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
                     a2_logits, a2 = self.att2(x)
                     attn2_logits = a2_logits
                     attn2 = a2
+                    attn2_map = a2
                     x = x * a2.expand_as(x)
                 else:
                     g2 = self.att2(x)
@@ -481,7 +484,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
         logits = self.classifier(x)
 
         if return_guidance:
-            return logits, feat2, attn2_logits
+            return logits, feat2, attn2_logits, attn2_map
         return logits
 
 
@@ -626,6 +629,41 @@ def compute_class_weights(dataset):
     return torch.tensor(full_weights, dtype=torch.float32, device=device)
 
 
+def compute_teacher_gradcam_map(teacher_model, inputs):
+    inputs_t = inputs.detach().requires_grad_(True)
+    teacher_model.eval()
+    logits_t, feat2_t, attn2_logits_t, _ = teacher_model(
+        inputs_t,
+        enable_attention=False,
+        return_guidance=True,
+    )
+
+    pred_classes = logits_t.argmax(dim=1)
+    target_scores_t = logits_t.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
+    conf = torch.softmax(logits_t, dim=1).max(dim=1)[0]
+    conf_mask = (conf > 0.5).float()
+
+    gradients = torch.autograd.grad(
+        outputs=target_scores_t.sum(),
+        inputs=feat2_t,
+        retain_graph=False,
+        create_graph=False,
+    )[0]
+
+    weights = gradients.mean(dim=(2, 3), keepdim=True)
+    guidance_map = torch.sum(weights * feat2_t, dim=1, keepdim=True)
+    guidance_map = F.relu(guidance_map)
+
+    g_mean = guidance_map.mean(dim=(2, 3), keepdim=True)
+    guidance_map = guidance_map / (g_mean + 1e-6)
+    guidance_map = guidance_map.clamp(max=5.0)
+
+    return {
+        "guidance_map": guidance_map,
+        "conf_mask": conf_mask,
+    }
+
+
 def evaluate(model, loader, criterion_cls):
     model.eval()
     total_loss = 0.0
@@ -653,6 +691,185 @@ def evaluate(model, loader, criterion_cls):
     }
 
 
+def build_soft_time_masks(width, early=(0.0, 0.3), late=(0.5, 0.9)):
+    early_mask = torch.zeros(width)
+    late_mask = torch.zeros(width)
+
+    for j in range(width):
+        l = j / width
+        r = (j + 1) / width
+        overlap_early = max(0.0, min(r, early[1]) - max(l, early[0]))
+        overlap_late = max(0.0, min(r, late[1]) - max(l, late[0]))
+        early_mask[j] = overlap_early * width
+        late_mask[j] = overlap_late * width
+
+    return early_mask, late_mask
+
+
+def attention_to_temporal_profile(attn_map):
+    total = attn_map.sum(dim=(2, 3), keepdim=True)
+    normalized = attn_map / (total + 1e-6)
+    q = normalized.sum(dim=2)
+    return q.squeeze(1)
+
+
+def compute_entropy_from_attention(attn_map):
+    normalized = attn_map / (attn_map.sum(dim=(2, 3), keepdim=True) + 1e-6)
+    entropy = -(normalized * torch.log(normalized + 1e-8)).sum(dim=(2, 3))
+    return entropy
+
+
+def compute_physics_scores_from_profile(q):
+    width = q.shape[1]
+    early_mask, late_mask = build_soft_time_masks(width)
+    early_mask = early_mask.to(q.device)
+    late_mask = late_mask.to(q.device)
+
+    early_mass = (q * early_mask).sum(dim=1)
+    late_mass = (q * late_mask).sum(dim=1)
+    union = early_mass + late_mass + 1e-6
+    balance = 1.0 - torch.abs(early_mass - late_mass) / (union + 1e-6)
+    midrate_score = union * balance
+
+    background_mask = torch.clamp(1.0 - early_mask - late_mask, min=0.0)
+    background_mass = (q * background_mask).sum(dim=1)
+
+    return {
+        "early_mass": early_mass,
+        "late_mass": late_mass,
+        "midrate_score": midrate_score,
+        "background_mass": background_mass,
+    }
+
+
+def compute_map_corr_and_iou(attn_map, gradcam_map, top_ratio=0.2):
+    batch = attn_map.shape[0]
+    attn_flat = attn_map.view(batch, -1)
+    grad_flat = gradcam_map.view(batch, -1)
+
+    attn_centered = attn_flat - attn_flat.mean(dim=1, keepdim=True)
+    grad_centered = grad_flat - grad_flat.mean(dim=1, keepdim=True)
+
+    numerator = (attn_centered * grad_centered).sum(dim=1)
+    denominator = torch.sqrt(
+        (attn_centered ** 2).sum(dim=1) * (grad_centered ** 2).sum(dim=1)
+    ) + 1e-6
+    pearson = numerator / denominator
+
+    k = max(1, int(attn_flat.shape[1] * top_ratio))
+    attn_thresh = torch.topk(attn_flat, k, dim=1)[0][:, -1]
+    grad_thresh = torch.topk(grad_flat, k, dim=1)[0][:, -1]
+
+    attn_peak = attn_flat >= attn_thresh.unsqueeze(1)
+    grad_peak = grad_flat >= grad_thresh.unsqueeze(1)
+    intersection = (attn_peak & grad_peak).sum(dim=1).float()
+    union = (attn_peak | grad_peak).sum(dim=1).float()
+    iou = intersection / (union + 1e-6)
+
+    return pearson, iou
+
+
+def evaluate_explainability(model, teacher_model, loader, correct_only=True):
+    model.eval()
+    teacher_model.eval()
+
+    sample_rows = []
+    early_scores, late_scores, mid_scores, background_scores = [], [], [], []
+    entropies, pearsons, ious = [], [], []
+    poor_early = []
+    good_late = []
+    midrate_vals = []
+
+    for inputs, labels in loader:
+        inputs = inputs.to(device)
+        labels = labels.to(device)
+
+        outputs, feat2, attn2_logits, attn2_map = model(
+            inputs,
+            enable_attention=(ATTENTION is not None),
+            return_guidance=True,
+        )
+
+        if attn2_map is None:
+            continue
+
+        preds = outputs.argmax(dim=1)
+        mask = preds == labels if correct_only else torch.ones_like(preds, dtype=torch.bool)
+        if mask.sum() == 0:
+            continue
+
+        selected_preds = preds[mask]
+        selected_labels = labels[mask]
+
+        gradcam_info = compute_teacher_gradcam_map(teacher_model, inputs)
+        gradcam_map = gradcam_info["guidance_map"][mask]
+
+        attn2_map = attn2_map[mask]
+        q = attention_to_temporal_profile(attn2_map)
+        physics_scores = compute_physics_scores_from_profile(q)
+
+        entropy_vals = compute_entropy_from_attention(attn2_map)
+        pearson_vals, iou_vals = compute_map_corr_and_iou(attn2_map, gradcam_map)
+
+        for idx in range(q.shape[0]):
+            early = physics_scores["early_mass"][idx]
+            late = physics_scores["late_mass"][idx]
+            mid = physics_scores["midrate_score"][idx]
+            background = physics_scores["background_mass"][idx]
+            ent = entropy_vals[idx]
+            pear = pearson_vals[idx]
+            iou = iou_vals[idx]
+
+            sample_rows.append(
+                {
+                    "pred": int(selected_preds[idx].item()),
+                    "label": int(selected_labels[idx].item()),
+                    "early_mass": float(early.item()),
+                    "late_mass": float(late.item()),
+                    "midrate_score": float(mid.item()),
+                    "background_mass": float(background.item()),
+                    "entropy": float(ent.item()),
+                    "pearson_corr": float(pear.item()),
+                    "iou_top20": float(iou.item()),
+                }
+            )
+
+        early_scores.extend(physics_scores["early_mass"].detach().cpu().tolist())
+        late_scores.extend(physics_scores["late_mass"].detach().cpu().tolist())
+        mid_scores.extend(physics_scores["midrate_score"].detach().cpu().tolist())
+        background_scores.extend(physics_scores["background_mass"].detach().cpu().tolist())
+        entropies.extend(entropy_vals.detach().cpu().tolist())
+        pearsons.extend(pearson_vals.detach().cpu().tolist())
+        ious.extend(iou_vals.detach().cpu().tolist())
+
+        for i in range(len(selected_labels)):
+            lbl = selected_labels[i].item()
+
+            if lbl == 2:
+                poor_early.append(physics_scores["early_mass"][i].item())
+            elif lbl == 0:
+                good_late.append(physics_scores["late_mass"][i].item())
+            elif lbl == 1:
+                midrate_vals.append(physics_scores["midrate_score"][i].item())
+
+    def mean_or_zero(values_list):
+        return float(np.mean(values_list)) if values_list else 0.0
+
+    summary_dict = {
+        "early_mass_all": mean_or_zero(early_scores),
+        "late_mass_all": mean_or_zero(late_scores),
+        "midrate_all": mean_or_zero(mid_scores),
+        "poor_early_mass": mean_or_zero(poor_early) if poor_early else 0,
+        "good_late_mass": mean_or_zero(good_late) if good_late else 0,
+        "midrate_score": mean_or_zero(midrate_vals) if midrate_vals else 0,
+        "entropy": mean_or_zero(entropies),
+        "pearson_corr": mean_or_zero(pearsons),
+        "iou_top20": mean_or_zero(ious),
+    }
+
+    return sample_rows, summary_dict
+
+
 def count_parameters(model):
     """统计模型可训练参数数量"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -668,7 +885,7 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
     labels = labels.to(device)
 
     # === student 分支：根据 ATTENTION 决定是否开启 attention ===
-    outputs, feat2_s, attn2_logits_s = student_model(
+    outputs, feat2_s, attn2_logits_s, _ = student_model(
         inputs,
         enable_attention=(ATTENTION is not None),
         return_guidance=True
@@ -684,42 +901,9 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
         if attn2_logits_s is None:
             raise RuntimeError("attn2_logits_s is None. ATTENTION==\"ASA\" 时应当产生 ASA2 注意力。")
 
-        # 使用 EMA teacher（关闭 attention）生成 Grad-CAM 目标
-        # 关键修复：创建 requires_grad=True 的输入副本，确保 feat2_t 能够正确进入可求导图
-        inputs_t = inputs.detach().requires_grad_(True)
-        teacher_model.eval()
-        logits_t, feat2_t, _ = teacher_model(
-            inputs_t,
-            enable_attention=False,
-            return_guidance=True
-        )
-
-        # ===== 改进 1: 使用 teacher 预测的类别而不是真实标签 =====
-        # 这样 CAM 来自 teacher 当前最 confident 的类别，避免早期被错误标签结构干扰
-        pred_classes = logits_t.argmax(dim=1)
-        target_scores_t = logits_t.gather(1, pred_classes.unsqueeze(1)).squeeze(1)
-
-        # ===== 可选: 置信度过滤 =====
-        # 只对高置信度样本加强监督，低置信度样本不强监督
-        conf = torch.softmax(logits_t, dim=1).max(dim=1)[0]
-        conf_mask = (conf > 0.5).float()  # 置信度 > 50% 才计算 guide loss
-
-        # 计算 Grad-CAM（不对 teacher forward 包 no_grad，因为需要 grad）
-        gradients = torch.autograd.grad(
-            outputs=target_scores_t.sum(),
-            inputs=feat2_t,
-            retain_graph=False,
-            create_graph=False,
-        )[0]
-
-        weights = gradients.mean(dim=(2, 3), keepdim=True)
-        guidance_map_G = torch.sum(weights * feat2_t, dim=1, keepdim=True)
-        guidance_map_G = F.relu(guidance_map_G)
-
-        # 改进的归一化：除以 mean（保持相对结构），加 clamp 防止极端值
-        g_mean = guidance_map_G.mean(dim=(2, 3), keepdim=True)
-        guidance_map_G = guidance_map_G / (g_mean + 1e-6)
-        guidance_map_G = guidance_map_G.clamp(max=5.0)
+        gradcam_info = compute_teacher_gradcam_map(teacher_model, inputs)
+        guidance_map_G = gradcam_info["guidance_map"]
+        conf_mask = gradcam_info["conf_mask"]
 
         # 尺寸安全检查
         assert guidance_map_G.shape == attn2_logits_s.shape, \
@@ -989,6 +1173,16 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
     print(f"Saved model: {model_path}")
 
     test_result = evaluate(model, test_loader, criterion_cls)
+    explain_samples, explain_summary = evaluate_explainability(
+        model,
+        teacher_model,
+        test_loader,
+        correct_only=True,
+    )
+    explainability_df = pd.DataFrame(explain_samples)
+    explainability_path = f"explainability_samples_outer_{outer_test_well}_{full_tag}.csv"
+    explainability_df.to_csv(explainability_path, index=False)
+    print(f"Saved explainability samples: {explainability_path}")
     report_text = classification_report(
         test_result["labels"],
         test_result["preds"],
@@ -1003,6 +1197,12 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
         "test_loss": test_result["loss"],
         "report_text": report_text,
         "confusion_matrix": cm,
+        "physics_poor_early": explain_summary["poor_early_mass"],
+        "physics_good_late": explain_summary["good_late_mass"],
+        "physics_midrate": explain_summary["midrate_score"],
+        "attention_entropy": explain_summary["entropy"],
+        "attention_corr": explain_summary["pearson_corr"],
+        "attention_iou": explain_summary["iou_top20"],
     }
 
 
@@ -1126,6 +1326,12 @@ def main():
                 "best_epoch": best_epoch,
                 "test_acc": final_result["test_acc"],
                 "test_loss": final_result["test_loss"],
+                "physics_poor_early": final_result["physics_poor_early"],
+                "physics_good_late": final_result["physics_good_late"],
+                "physics_midrate": final_result["physics_midrate"],
+                "attention_entropy": final_result["attention_entropy"],
+                "attention_corr": final_result["attention_corr"],
+                "attention_iou": final_result["attention_iou"],
                 "train_time_epoch_sec": avg_epoch_time,
                 "gpu_memory_mb": avg_gpu_mem,
             }
