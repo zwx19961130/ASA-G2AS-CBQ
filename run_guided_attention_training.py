@@ -54,7 +54,7 @@ if ATTENTION == "None":
     ATTENTION = None
 
 # ===== ASA ablation switches =====
-ASA_PLACEMENT = os.environ.get("ASA_PLACEMENT", "before")  
+ASA_PLACEMENT = os.environ.get("ASA_PLACEMENT", "after")  
 # options: before | after
 if ASA_PLACEMENT not in ("before", "after"):
     raise ValueError(f"Invalid ASA_PLACEMENT '{ASA_PLACEMENT}'; must be 'before' or 'after'.")
@@ -69,7 +69,7 @@ if ASA_FUSION not in ("sum", "weighted", "gate"):
 if ASA_COMPONENT not in ("full", "horizontal", "vertical"):
     raise ValueError(f"Invalid ASA_COMPONENT '{ASA_COMPONENT}'; must be 'full', 'horizontal' or 'vertical'.")
 
-ASA_HPOOL = os.environ.get("ASA_HPOOL", "mean")  
+ASA_HPOOL = os.environ.get("ASA_HPOOL", "conv")  
 # "mean" = current design (mean over H)
 # "conv" = keep depth position (no mean pooling)
 if ASA_HPOOL not in ("mean", "conv"):
