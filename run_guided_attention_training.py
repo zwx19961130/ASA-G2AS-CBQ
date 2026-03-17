@@ -62,7 +62,7 @@ if ASA_PLACEMENT not in ("before", "after"):
 ASA_COMPONENT = os.environ.get("ASA_COMPONENT", "full")  
 # options: full | horizontal | vertical
 
-ASA_FUSION = os.environ.get("ASA_FUSION", "sum")  
+ASA_FUSION = os.environ.get("ASA_FUSION", "gate")  
 # options: sum | weighted | gate
 if ASA_FUSION not in ("sum", "weighted", "gate"):
     raise ValueError(f"Invalid ASA_FUSION '{ASA_FUSION}'; must be 'sum', 'weighted' or 'gate'.")
@@ -1012,11 +1012,13 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
             loop.set_postfix(train_loss=f"{running_loss / max(1, num_batches):.4f}")
 
         # epoch 结束时打印 GGAS 统计信息
+        mean_cls = mean_guide = mean_lambda_guide = mean_conf = mean_train_loss = 0.0
         if num_batches > 0:
             mean_cls = sum_cls / num_batches
             mean_guide = sum_guide / num_batches
             mean_lambda_guide = effective_lambda * mean_guide
             mean_conf = sum_conf / num_batches
+            mean_train_loss = running_loss / num_batches
 
 
         # 计算训练时间和显存使用
@@ -1025,13 +1027,34 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
         peak_mem_mb = torch.cuda.max_memory_allocated() / 1024**2
 
         val_result = evaluate(model, val_loader, criterion_cls)
+        print(
+            f"[Epoch {epoch + 1:03d}/{fixed_epochs:03d}] "
+            f"guidance={guidance_status} "
+            f"lambda={effective_lambda:.4g} | "
+            f"train_loss={mean_train_loss:.4f} | "
+            f"cls_loss={mean_cls:.4f} | "
+            f"guide_loss={mean_guide:.4f} | "
+            f"lambda*guide={mean_lambda_guide:.4f} | "
+            f"conf={mean_conf:.4f} | "
+            f"val_loss={val_result['loss']:.4f} | "
+            f"val_acc={val_result['acc']:.2f}% | "
+            f"time={epoch_time:.2f}s | "
+            f"gpu={peak_mem_mb:.1f}MB"
+        )
         epoch_metrics.append(
             {
                 "epoch": epoch + 1,
+                "guidance_status": guidance_status,
+                "effective_lambda": effective_lambda,
+                "train_loss": mean_train_loss,
+                "cls_loss": mean_cls,
+                "guide_loss": mean_guide,
+                "lambda_guide_loss": mean_lambda_guide,
+                "conf_mean": mean_conf,
                 "val_loss": val_result["loss"],
                 "val_acc": val_result["acc"],
                 "time_per_epoch_sec": epoch_time,
-                "gpu_mem_mb": peak_mem_mb
+                "gpu_mem_mb": peak_mem_mb,
             }
         )
 
@@ -1163,6 +1186,16 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
             mean_guide = sum_guide / num_batches
             mean_lambda_guide = effective_lambda * mean_guide
             mean_conf = sum_conf / num_batches
+
+            print(
+                f"[Final Epoch {epoch + 1:03d}/{best_epoch:03d}] "
+                f"guidance={guidance_status} "
+                f"lambda={effective_lambda:.4g} | "
+                f"cls_loss={mean_cls:.4f} | "
+                f"guide_loss={mean_guide:.4f} | "
+                f"lambda*guide={mean_lambda_guide:.4f} | "
+                f"conf={mean_conf:.4f}"
+            )
 
 
     # 保存模型
