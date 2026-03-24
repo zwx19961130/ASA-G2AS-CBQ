@@ -48,7 +48,7 @@ NUM_CLASSES = 3
 LEARNING_RATE = 2e-5
 IMAGE_SIZE = (VERTICAL_RESOLUTION, 40)
 INNER_EPOCHS = 50
-LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.0))  # 建议范围: 0.001~0.1
+LAMBDA_GUIDANCE = float(os.environ.get("LAMBDA", 0.0))  # Recommended range: 0.001~0.1
 ATTENTION = os.environ.get("ATTENTION", "ASA")  # options: "ASA", "SE", "ECA", "CBAM", "None"
 if ATTENTION == "None":
     ATTENTION = None
@@ -83,12 +83,12 @@ ATT_L3 = bool(int(os.environ.get("ATT_L3", "1")))  # set to 0/1 if you prefer en
 # data augmentation flags
 USE_HFLIP = bool(int(os.environ.get("USE_HFLIP", "0")))
 USE_TIMESHIFT = bool(int(os.environ.get("USE_TIMESHIFT", "0")))
-TIMESHIFT_MAX = int(os.environ.get("TIMESHIFT_MAX", "2"))  # 建议先用 2
+TIMESHIFT_MAX = int(os.environ.get("TIMESHIFT_MAX", "2"))  # Start with 2 recommended
 
 
 USE_WEIGHTED_SAMPLER = True
-EMA_DECAY = 0.99  # EMA teacher 衰减率
-WARMUP_EPOCHS = 2  # warmup 阶段，前 N 个 epoch 不启用 guidance，只训练分类
+EMA_DECAY = 0.99  # EMA teacher decay factor
+WARMUP_EPOCHS = 2  # warmup stage: first N epochs disable guidance, train classification only
 USE_CLASS_WEIGHT_IN_LOSS = False
 USE_FOCAL_LOSS = False
 FOCAL_GAMMA = 2.0
@@ -401,9 +401,9 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
     def forward(self, x, enable_attention=None, return_guidance=False):
         """
         enable_attention:
-            True/False 强制开关 attention；None 表示根据 self.attention
+            True/False force attention on/off; None means use self.attention setting
         return_guidance:
-            True 时返回 (logits, feat2, attn2_logits, attn2_map)；否则只返回 logits
+            If True, return (logits, feat2, attn2_logits, attn2_map); otherwise return logits only
         """
         if enable_attention is None:
             enable_attention = self.attention is not None
@@ -435,7 +435,7 @@ class LightweightVDLNet_PlacementAblation(nn.Module):
 
         x = self.block2_conv(x)
 
-        # --- 关键：无论 enable_attention 是否开启，都在"attention2应当作用的位置"取 feat2 ---
+        # --- Key: regardless of enable_attention, capture feat2 at the point where attention2 should apply ---
         if self.asa_before_pool:
             feat2 = x
             if enable_attention and ATT_L2:
@@ -521,7 +521,7 @@ class TimeShift:
 
         out = np.full_like(arr, self.fill)
 
-        # width 方向平移：左右 shift
+        # horizontal shift along the width axis
         if shift > 0:
             out[:, shift:] = arr[:, :-shift]
         else:
@@ -594,7 +594,7 @@ def build_loader(dataset, is_train):
 
 
 def build_ema_teacher(student_model):
-    """构建 EMA teacher 模型（student 的副本，冻结参数）"""
+    """Build EMA teacher model (copy of student, with frozen parameters)."""
     teacher_model = copy.deepcopy(student_model)
     teacher_model.eval()
     for p in teacher_model.parameters():
@@ -603,14 +603,14 @@ def build_ema_teacher(student_model):
 
 
 def update_ema_teacher(student_model, teacher_model, ema_decay):
-    """更新 EMA teacher 参数和 BN buffers: θ_teacher = α * θ_teacher + (1-α) * θ_student"""
+    """Update EMA teacher parameters and BN buffers: θ_teacher = α * θ_teacher + (1-α) * θ_student"""
     with torch.no_grad():
-        # 更新参数 (weights & biases)
+        # update parameters (weights & biases)
         for t_param, s_param in zip(teacher_model.parameters(), student_model.parameters()):
             t_param.data.mul_(ema_decay).add_(s_param.data, alpha=1.0 - ema_decay)
 
-        # 更新 BN buffers (running_mean, running_var)
-        # 注意：只对浮点型 buffer 做 EMA，非浮点 buffer（如 num_batches_tracked）直接 copy
+        # update BN buffers (running_mean, running_var)
+        # Note: apply EMA only to floating-point buffers, copy non-floating buffers (e.g., num_batches_tracked)
         for t_buffer, s_buffer in zip(teacher_model.buffers(), student_model.buffers()):
             if t_buffer.dtype.is_floating_point:
                 t_buffer.data.mul_(ema_decay).add_(s_buffer.data, alpha=1.0 - ema_decay)
@@ -871,20 +871,20 @@ def evaluate_explainability(model, teacher_model, loader, correct_only=True):
 
 
 def count_parameters(model):
-    """统计模型可训练参数数量"""
+    """Count model trainable parameters."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def training_step(student_model, teacher_model, inputs, labels, optimizer, criterion_cls, lambda_guidance):
     """
-    统一的训练步骤：student forward + EMA teacher forward for GGAS
+    Unified training step: student forward + EMA teacher forward for GGAS
 
-    返回: (total_loss, l_cls, l_guide)
+    Returns: (total_loss, l_cls, l_guide)
     """
     inputs = inputs.to(device)
     labels = labels.to(device)
 
-    # === student 分支：根据 ATTENTION 决定是否开启 attention ===
+    # === student branch: decide whether to apply attention based on ATTENTION ===
     outputs, feat2_s, attn2_logits_s, _ = student_model(
         inputs,
         enable_attention=(ATTENTION is not None),
@@ -892,45 +892,45 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
     )
     l_cls = criterion_cls(outputs, labels)
 
-    # === teacher 分支：使用 EMA teacher 生成 Grad-CAM 指导图 G ===
-    # 只有当 LAMBDA_GUIDANCE > 0 且 ATTENTION == "ASA" 时才计算 guidance
+    # === teacher branch: use EMA teacher to generate Grad-CAM guidance map G ===
+    # Guidance is computed only when LAMBDA_GUIDANCE > 0 and ATTENTION == "ASA"
     l_guide = torch.tensor(0.0, device=device)
     conf_mask = torch.tensor(0.0, device=device)
 
     if lambda_guidance > 0 and ATTENTION == "ASA": 
         if attn2_logits_s is None:
-            raise RuntimeError("attn2_logits_s is None. ATTENTION==\"ASA\" 时应当产生 ASA2 注意力。")
+            raise RuntimeError("attn2_logits_s is None. ATTENTION==\"ASA\" should produce ASA2 attention.")
 
         gradcam_info = compute_teacher_gradcam_map(teacher_model, inputs)
         guidance_map_G = gradcam_info["guidance_map"]
         conf_mask = gradcam_info["conf_mask"]
 
-        # 尺寸安全检查
+        # Size safety check
         assert guidance_map_G.shape == attn2_logits_s.shape, \
             f"Shape mismatch: guidance_map_G {guidance_map_G.shape} vs attn2_logits_s {attn2_logits_s.shape}"
 
-        # ===== 改进 2: 使用 KL divergence 匹配空间分布而不是 MSE 匹配绝对值 =====
-        # 将 attention logits 和 guidance map 转为概率分布，然后计算 KL divergence
+        # ===== Improvement 2: use KL divergence to match spatial distributions instead of MSE on absolute values =====
+        # Convert attention logits and guidance map into distributions, then compute KL divergence
         b = attn2_logits_s.shape[0]
 
         # flatten spatial dimensions
         attn_flat = attn2_logits_s.view(b, -1)
         g_flat = guidance_map_G.view(b, -1)
 
-        # 转成概率分布 (softmax over spatial dimensions)
+        # Convert to probability distributions (softmax over spatial dimensions)
         attn_prob = F.softmax(attn_flat, dim=1)
         g_prob = F.softmax(g_flat, dim=1)
 
-        # KL divergence: KL(student || teacher) - student 分布去逼近 teacher 分布
-        # 重要：detach 的是 teacher 目标 g_prob，保留 student attn_prob 以获得梯度
-        # 方向：log(attn_prob) 是 input，g_prob 是 target
+        # KL divergence: KL(student || teacher) - student distribution approximates teacher distribution
+        # Important: detach teacher target g_prob, keep student attn_prob for gradients
+        # Direction: log(attn_prob) is input, g_prob is target
         guide_raw = F.kl_div(
             torch.log(attn_prob + 1e-8),
             g_prob.detach(),
             reduction="none"
         ).sum(dim=1)
 
-        # 使用 conf_mask 过滤低置信度样本，并用 sum/denom 避免被 0 稀释
+        # Use conf_mask to filter low-confidence samples, and use sum/denom to avoid dilution by zeros
         l_guide = (guide_raw * conf_mask).sum() / (conf_mask.sum() + 1e-6)
 
     total_loss = l_cls + lambda_guidance * l_guide
@@ -939,7 +939,7 @@ def training_step(student_model, teacher_model, inputs, labels, optimizer, crite
     total_loss.backward()
     optimizer.step()
 
-    # 更新 EMA teacher（无条件更新，确保 warmup 期间 teacher 也会跟随 student 更新）
+    # Update EMA teacher (unconditional update, so teacher tracks student even during warmup)
     update_ema_teacher(student_model, teacher_model, EMA_DECAY)
 
     return total_loss, l_cls.detach(), l_guide.detach(), conf_mask.mean().detach()
@@ -951,7 +951,7 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
         attention=ATTENTION,
     ).to(device)
 
-    # 创建 EMA teacher 模型
+    # create EMA teacher model
     teacher_model = build_ema_teacher(model)
 
     class_weights = (
@@ -972,17 +972,17 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
         model.train()
         running_loss = 0.0
 
-        # 计时与显存统计
+        # timing and GPU memory stats
         torch.cuda.reset_peak_memory_stats()
         start_time = time.time()
 
-        # 累加变量，用于统计 GGAS 信息
+        # accumulators for GGAS statistics
         sum_cls = 0.0
         sum_guide = 0.0
         sum_conf = 0.0
         num_batches = 0
 
-        # warmup: 前 WARMUP_EPOCHS 个 epoch 不启用 guidance，只训练分类
+        # warmup: first WARMUP_EPOCHS epochs disable guidance, classification only
         if epoch < WARMUP_EPOCHS:
             effective_lambda = 0.0
             guidance_status = "warmup"
@@ -1003,7 +1003,7 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
             )
 
             running_loss += total_loss.item()
-            # 累计 GGAS 统计信息
+            # accumulate GGAS statistics
             sum_cls += l_cls.item()
             sum_guide += l_guide.item()
             sum_conf += conf_mean.item()
@@ -1011,7 +1011,7 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
 
             loop.set_postfix(train_loss=f"{running_loss / max(1, num_batches):.4f}")
 
-        # epoch 结束时打印 GGAS 统计信息
+        # print GGAS statistics at end of epoch
         mean_cls = mean_guide = mean_lambda_guide = mean_conf = mean_train_loss = 0.0
         if num_batches > 0:
             mean_cls = sum_cls / num_batches
@@ -1021,7 +1021,7 @@ def train_with_guidance(train_loader, val_loader, fixed_epochs):
             mean_train_loss = running_loss / num_batches
 
 
-        # 计算训练时间和显存使用
+        # calculate training time and memory usage
         epoch_time = time.time() - start_time
         # peak memory in megabytes
         peak_mem_mb = torch.cuda.max_memory_allocated() / 1024**2
@@ -1132,7 +1132,7 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
         attention=ATTENTION,
     ).to(device)
 
-    # 创建 EMA teacher 模型
+    # create EMA teacher model
     teacher_model = build_ema_teacher(model)
 
     class_weights = compute_class_weights(train_ds) if USE_CLASS_WEIGHT_IN_LOSS else None
@@ -1147,13 +1147,13 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
     for epoch in range(best_epoch):
         model.train()
 
-        # 累加变量，用于统计 GGAS 信息
+        # accumulators for GGAS statistics
         sum_cls = 0.0
         sum_guide = 0.0
         sum_conf = 0.0
         num_batches = 0
 
-        # warmup: 前 WARMUP_EPOCHS 个 epoch 不启用 guidance，只训练分类
+        # warmup: first WARMUP_EPOCHS epochs disable guidance, classification only
         if epoch < WARMUP_EPOCHS:
             effective_lambda = 0.0
             guidance_status = "warmup"
@@ -1174,13 +1174,13 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
                 lambda_guidance=effective_lambda
             )
 
-            # 累计 GGAS 统计信息
+            # accumulate GGAS statistics
             sum_cls += l_cls.item()
             sum_guide += l_guide.item()
             sum_conf += conf_mean.item()
             num_batches += 1
 
-        # epoch 结束时打印 GGAS 统计信息
+        # print GGAS statistics at end of epoch
         if num_batches > 0:
             mean_cls = sum_cls / num_batches
             mean_guide = sum_guide / num_batches
@@ -1198,7 +1198,7 @@ def train_full_outer_and_test(outer_train_wells, outer_test_well, train_transfor
             )
 
 
-    # 保存模型
+    # save model
     att_name = ATTENTION if ATTENTION is not None else "None"
     placement_tag = f"att{att_name}_L1{int(ATT_L1)}_L2{int(ATT_L2)}_L3{int(ATT_L3)}"
     model_path = f"guided_model_outer_{outer_test_well}_{full_tag}_lambda{LAMBDA_GUIDANCE}.pt"
@@ -1268,7 +1268,7 @@ def main():
 
     print(f"Device: {device}")
 
-    # 打印模型参数量
+    # print model parameter count
     model = LightweightVDLNet_PlacementAblation(
         num_classes=NUM_CLASSES,
         attention=ATTENTION,
@@ -1341,7 +1341,7 @@ def main():
         print("Outer test confusion matrix:")
         print(final_result["confusion_matrix"])
 
-        # 统计训练时间和显存使用（使用 inner_histories 而不是 inner_curve）
+        # collect training time and memory usage (use inner_histories rather than inner_curve)
         all_times = []
         all_mems = []
 
